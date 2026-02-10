@@ -57,9 +57,47 @@ The action manages branch deletion itself. GitHub's auto-delete setting must be 
 gh api -X PATCH "/repos/OWNER/REPO" --input - <<< '{"delete_branch_on_merge":false}'
 ```
 
-**2. Add the workflow**
+**2. Create a GitHub App**
+
+When autorestack pushes the synthetic merge commit to upstack branches, you probably want CI to run on those PRs so they can become mergeable. Pushes made with the default `GITHUB_TOKEN` [do not trigger workflow runs](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) — this is a deliberate GitHub limitation to prevent infinite loops. A GitHub App installation token does not have this limitation.
+
+1. [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) with the following repository permissions:
+   - **Contents:** Read and write (to push branches)
+   - **Pull requests:** Read and write (to update PRs, add labels, post comments)
+2. Install the app on your repository
+3. Store the App ID in a repository variable (e.g. `AUTORESTACK_APP_ID`)
+4. Generate a private key and store it in a repository secret (e.g. `AUTORESTACK_PRIVATE_KEY`)
+
+**3. Add the workflow**
 
 Create a `.github/workflows/update-pr-stack.yml` file:
+```yaml
+name: Update PR Stack
+
+on:
+  pull_request:
+    types: [closed, synchronize]
+
+jobs:
+  update-pr-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.AUTORESTACK_APP_ID }}
+          private-key: ${{ secrets.AUTORESTACK_PRIVATE_KEY }}
+
+      - uses: Phlogistique/autorestack-action@main
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+```
+
+<details>
+<summary>Using <code>GITHUB_TOKEN</code> instead (CI won't trigger on upstack PRs)</summary>
+
+If you don't need CI checks on upstack PRs — for example, if your repository has no branch protection rules requiring status checks — you can use the default token:
+
 ```yaml
 name: Update PR Stack
 
@@ -79,6 +117,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+</details>
 
 ### Notes
 

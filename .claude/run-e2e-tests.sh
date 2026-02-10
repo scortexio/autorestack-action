@@ -63,8 +63,8 @@ acquire_token() {
     log_info "Acquiring GitHub App token..."
 
     # Check if required environment variables are set
-    if [[ -z "$GH_APP_ID" ]] || [[ -z "$GH_APP_PRIVATE_KEY_PEM_B64" ]]; then
-        log_error "Missing required environment variables: GH_APP_ID and/or GH_APP_PRIVATE_KEY_PEM_B64"
+    if [[ -z "$GH_APP_ID" ]] || [[ -z "$GH_APP_PRIVATE_KEY" ]]; then
+        log_error "Missing required environment variables: GH_APP_ID and/or GH_APP_PRIVATE_KEY"
         return 1
     fi
 

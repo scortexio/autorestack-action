@@ -15,7 +15,7 @@ Caches tokens and reuses them until they expire (with 5-minute buffer).
 
 Environment variables required:
 - GH_APP_ID: GitHub App ID
-- GH_APP_PRIVATE_KEY_PEM_B64: Base64-encoded private key
+- GH_APP_PRIVATE_KEY: PEM private key
 
 Usage:
     # Run with uv (automatically installs dependencies)
@@ -28,7 +28,6 @@ Usage:
     export GITHUB_TOKEN=$(uv run get_github_app_token.py)
 """
 
-import base64
 import json
 import os
 import sys
@@ -99,14 +98,11 @@ def generate_installation_token():
     """Generate a new installation access token for the GitHub App."""
     # Get credentials from environment
     app_id = os.getenv("GH_APP_ID")
-    private_key_b64 = os.getenv("GH_APP_PRIVATE_KEY_PEM_B64")
+    private_key = os.getenv("GH_APP_PRIVATE_KEY")
 
-    if not all([app_id, private_key_b64]):
-        print("Error: Missing GH_APP_ID or GH_APP_PRIVATE_KEY_PEM_B64", file=sys.stderr)
+    if not all([app_id, private_key]):
+        print("Error: Missing GH_APP_ID or GH_APP_PRIVATE_KEY", file=sys.stderr)
         sys.exit(1)
-
-    # Decode private key
-    private_key = base64.b64decode(private_key_b64).decode('utf-8')
 
     # Generate JWT
     now = int(time.time())
