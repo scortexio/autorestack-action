@@ -4,7 +4,11 @@ author: 'GitHub Actions'
 
 inputs:
   github-token:
-    description: 'GitHub token for API access'
+    description: >
+      Token for git push and GitHub API calls. The default GITHUB_TOKEN will NOT
+      trigger CI on upstack PRs (GitHub deliberately suppresses workflow runs from
+      pushes made with that token). Use a GitHub App installation token if you need
+      checks to run on the updated PRs.
     required: true
     default: ${{ github.token }}
 
