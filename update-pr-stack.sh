@@ -78,9 +78,13 @@ update_direct_target() {
         CONFLICTS+=("origin/$MERGED_BRANCH")
         log_cmd git merge --abort
     fi
-    if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
-        CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)" )
-        log_cmd git merge --abort
+    # Only try merging the pre-squash target state if it's not already
+    # included in the merged branch — otherwise the first merge covers it.
+    if ! git merge-base --is-ancestor SQUASH_COMMIT~ "origin/$MERGED_BRANCH"; then
+        if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
+            CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)" )
+            log_cmd git merge --abort
+        fi
     fi
 
     if [[ "${#CONFLICTS[@]}" -gt 0 ]]; then
