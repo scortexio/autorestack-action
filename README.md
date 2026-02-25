@@ -10,7 +10,7 @@ If you use squash & merge instead, your main branch history stays nice and clean
 
 ### The solution
 
-This action tries to fix that in a transparent way. Install it, and hopefully the workflow of stacking + merge during dev + squash merge when landing works.
+This action tries to fix that in a transparent way. Install it, and hopefully the workflow of stacking + merge during dev + squash merge when landing works. It also works if you rebase during development instead of merging.
 
 ---
 
