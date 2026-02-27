@@ -97,6 +97,22 @@
 #   - Deletes feature2 branch (no other conflicted PRs depend on it)
 #   - NOTE: feature4 is NOT updated (indirect children are not modified)
 #
+# SCENARIO 4: Multi-child with 0 conflicts (Steps 23-25)
+# -------------------------------------------------------
+# Tests that when a PR with 2 children is merged and neither conflicts,
+# both children are cleanly updated, diffs preserved, and old base deleted.
+#
+# SCENARIO 5: Multi-child with mixed outcome (Steps 26-28)
+# ---------------------------------------------------------
+# Tests that when one child conflicts and the other merges cleanly, the
+# clean child is fully updated while the conflicted child keeps the old base.
+# The old base branch is kept for the conflicted child.
+#
+# SCENARIO 6: No direct children / 0-child run (Steps 29-31)
+# -----------------------------------------------------------
+# Tests that merging a PR with no children simply deletes the branch
+# and the action completes successfully.
+#
 # =============================================================================
 set -e # Exit immediately if a command exits with a non-zero status.
 # set -x # Debugging: print commands as they are executed
@@ -165,13 +181,18 @@ get_pr_diff() {
 }
 
 # Compare two diffs and return 0 if identical, 1 if different.
-# Also prints a message describing the result.
+# Strips "index" lines (blob SHA pairs) since those change legitimately
+# when the base branch changes.
 compare_diffs() {
     local diff1="$1"
     local diff2="$2"
     local context="$3"
 
-    if [[ "$diff1" == "$diff2" ]]; then
+    local stripped1 stripped2
+    stripped1=$(echo "$diff1" | grep -v '^index ')
+    stripped2=$(echo "$diff2" | grep -v '^index ')
+
+    if [[ "$stripped1" == "$stripped2" ]]; then
         echo >&2 "✅ Diffs match: $context"
         return 0
     else
@@ -265,7 +286,7 @@ wait_for_synchronize_workflow() {
                 --workflow "$WORKFLOW_FILE" \
                 --event pull_request \
                 --limit 15 \
-                --json databaseId,createdAt --jq '.[] | select(.createdAt >= "'$(date -d "@$start_time" -Iseconds 2>/dev/null || date -r $start_time +%Y-%m-%dT%H:%M:%S)'") | .databaseId' || echo "")
+                --json databaseId,createdAt --jq '.[] | select(.createdAt >= "'$(date -u -d "@$start_time" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r $start_time +%Y-%m-%dT%H:%M:%SZ)'") | .databaseId' || echo "")
 
             if [[ -z "$candidate_run_ids" ]]; then
                 echo >&2 "No recent '$WORKFLOW_FILE' runs found since start. Sleeping $sleep_time seconds."
@@ -483,6 +504,13 @@ echo "Base file content line 4" >> file.txt
 echo "Base file content line 5" >> file.txt
 echo "Base file content line 6" >> file.txt
 echo "Base file content line 7" >> file.txt
+echo "Base file content line 8" >> file.txt
+echo "Base file content line 9" >> file.txt
+echo "Base file content line 10" >> file.txt
+echo "Base file content line 11" >> file.txt
+echo "Base file content line 12" >> file.txt
+echo "Base file content line 13" >> file.txt
+echo "Base file content line 14" >> file.txt
 log_cmd git add file.txt
 log_cmd git commit -m "Initial commit"
 INITIAL_COMMIT_SHA=$(git rev-parse HEAD)
@@ -1192,6 +1220,304 @@ else
 fi
 
 echo >&2 "--- Sibling Conflicts Scenario Test Completed Successfully ---"
+
+
+# --- SCENARIO 4: Multi-child with 0 conflicts ---
+# ===================================================================================
+# Tests that when a PR with multiple children is merged and none conflict,
+# all children are cleanly updated and the old base branch is deleted.
+#
+# Setup:
+#   - Create main <- feature8 <- (feature9, feature10) parallel children
+#   - feature9 and feature10 modify different lines (no conflict with each other or main)
+#
+# Expected Behavior:
+#   - After merging feature8, both feature9 and feature10 are cleanly rebased
+#   - Both PRs' base branches updated to main
+#   - feature8 branch is deleted (no conflicts)
+# ===================================================================================
+
+echo >&2 "--- Testing Multi-child No Conflicts Scenario ---"
+
+echo >&2 "23. Creating stack for multi-child no-conflict test..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+# Create feature8 based on main
+log_cmd git checkout -b feature8 main
+sed -i '2s/.*/Feature 8 content line 2/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 8"
+log_cmd git push origin feature8
+PR8_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature8 --title "Feature 8" --body "This is PR 8")
+PR8_NUM=$(echo "$PR8_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR8_NUM: $PR8_URL"
+
+# Create feature9 based on feature8 (modifies line 3 — no conflict)
+log_cmd git checkout -b feature9 feature8
+sed -i '3s/.*/Feature 9 content line 3/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 9 (modifies line 3)"
+log_cmd git push origin feature9
+PR9_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature8 --head feature9 --title "Feature 9" --body "This is PR 9, child of PR 8")
+PR9_NUM=$(echo "$PR9_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR9_NUM: $PR9_URL"
+
+# Capture PR9 diff before merge
+PR9_DIFF_BEFORE=$(get_pr_diff "$PR9_URL")
+
+# Create feature10 based on feature8 (modifies line 4 — no conflict)
+log_cmd git checkout feature8
+log_cmd git checkout -b feature10
+sed -i '4s/.*/Feature 10 content line 4/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 10 (modifies line 4)"
+log_cmd git push origin feature10
+PR10_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature8 --head feature10 --title "Feature 10" --body "This is PR 10, child of PR 8")
+PR10_NUM=$(echo "$PR10_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR10_NUM: $PR10_URL"
+
+# Capture PR10 diff before merge
+PR10_DIFF_BEFORE=$(get_pr_diff "$PR10_URL")
+
+# 24. Merge feature8 to trigger clean updates on both children
+echo >&2 "24. Squash merging PR #$PR8_NUM (feature8)..."
+merge_pr_with_retry "$PR8_URL"
+MERGE_COMMIT_SHA8=$(gh pr view "$PR8_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+echo >&2 "PR #$PR8_NUM merged. Squash commit SHA: $MERGE_COMMIT_SHA8"
+
+echo >&2 "Waiting for workflow..."
+if ! wait_for_workflow "$PR8_NUM" "feature8" "$MERGE_COMMIT_SHA8" "success"; then
+    echo >&2 "Workflow for PR8 merge did not complete successfully."
+    exit 1
+fi
+
+# 25. Verify both children updated cleanly
+echo >&2 "25. Verifying multi-child clean update..."
+log_cmd git fetch origin --prune
+
+# feature8 branch should be deleted (no conflicts)
+if git show-ref --verify --quiet refs/remotes/origin/feature8; then
+    echo >&2 "❌ Verification Failed: Remote branch 'origin/feature8' still exists."
+    exit 1
+else
+    echo >&2 "✅ Verification Passed: Remote branch 'origin/feature8' was deleted."
+fi
+
+# Both PRs should have main as base
+PR9_BASE=$(gh pr view "$PR9_NUM" --repo "$REPO_FULL_NAME" --json baseRefName --jq .baseRefName)
+PR10_BASE=$(gh pr view "$PR10_NUM" --repo "$REPO_FULL_NAME" --json baseRefName --jq .baseRefName)
+
+if [[ "$PR9_BASE" == "main" && "$PR10_BASE" == "main" ]]; then
+    echo >&2 "✅ Verification Passed: Both PRs updated to base 'main'."
+else
+    echo >&2 "❌ Verification Failed: PR9 base='$PR9_BASE', PR10 base='$PR10_BASE', expected both 'main'."
+    exit 1
+fi
+
+# Neither PR should have conflict labels
+PR9_LABEL=$(gh pr view "$PR9_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
+PR10_LABEL=$(gh pr view "$PR10_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
+
+if [[ -z "$PR9_LABEL" && -z "$PR10_LABEL" ]]; then
+    echo >&2 "✅ Verification Passed: Neither PR has conflict labels."
+else
+    echo >&2 "❌ Verification Failed: PR9 label='$PR9_LABEL', PR10 label='$PR10_LABEL'."
+    exit 1
+fi
+
+# Diffs should be preserved
+PR9_DIFF_AFTER=$(get_pr_diff "$PR9_URL")
+PR10_DIFF_AFTER=$(get_pr_diff "$PR10_URL")
+compare_diffs "$PR9_DIFF_BEFORE" "$PR9_DIFF_AFTER" "PR9 diff preserved after multi-child clean update"
+compare_diffs "$PR10_DIFF_BEFORE" "$PR10_DIFF_AFTER" "PR10 diff preserved after multi-child clean update"
+
+echo >&2 "--- Multi-child No Conflicts Scenario Test Completed Successfully ---"
+
+
+# --- SCENARIO 5: Multi-child with mixed outcome (one conflicts, one succeeds) ---
+# ===================================================================================
+# Tests that when one child conflicts and the other merges cleanly, the old base
+# branch is kept (for the conflicted child) and the clean child is fully updated.
+#
+# Setup:
+#   - Create main <- feature11 <- (feature12, feature13) parallel children
+#   - feature12 modifies line 5 (will conflict with a main change)
+#   - feature13 modifies line 14 (no conflict — far enough from line 5 to avoid overlapping hunks)
+#   - Push a conflicting change to line 5 on main
+#
+# Expected Behavior:
+#   - feature13 is cleanly updated, base changed to main
+#   - feature12 gets conflict label, base stays feature11
+#   - feature11 branch is kept (still referenced by conflicted PR12)
+# ===================================================================================
+
+echo >&2 "--- Testing Multi-child Mixed Outcome Scenario ---"
+
+echo >&2 "26. Creating stack for mixed outcome test..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+# Create feature11 based on main
+log_cmd git checkout -b feature11 main
+sed -i '2s/.*/Feature 11 content line 2/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 11"
+log_cmd git push origin feature11
+PR11_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature11 --title "Feature 11" --body "This is PR 11")
+PR11_NUM=$(echo "$PR11_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR11_NUM: $PR11_URL"
+
+# Create feature12 based on feature11 (modifies line 5 — will conflict)
+log_cmd git checkout -b feature12 feature11
+sed -i '5s/.*/Feature 12 conflicting content line 5/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 12 (modifies line 5)"
+log_cmd git push origin feature12
+PR12_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature11 --head feature12 --title "Feature 12" --body "This is PR 12, child of PR 11")
+PR12_NUM=$(echo "$PR12_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR12_NUM: $PR12_URL"
+
+# Create feature13 based on feature11 (modifies line 6 — no conflict)
+log_cmd git checkout feature11
+log_cmd git checkout -b feature13
+sed -i '14s/.*/Feature 13 content line 14/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 13 (modifies line 14)"
+log_cmd git push origin feature13
+PR13_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature11 --head feature13 --title "Feature 13" --body "This is PR 13, child of PR 11")
+PR13_NUM=$(echo "$PR13_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR13_NUM: $PR13_URL"
+
+# Capture PR13 diff before merge
+PR13_DIFF_BEFORE=$(get_pr_diff "$PR13_URL")
+
+# Push conflicting change to main (line 5)
+log_cmd git checkout main
+sed -i '5s/.*/Main conflicting content line 5 for scenario 5/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add conflicting change on main line 5 (scenario 5)"
+log_cmd git push origin main
+
+# 27. Merge feature11 to trigger mixed outcome
+echo >&2 "27. Squash merging PR #$PR11_NUM (feature11)..."
+merge_pr_with_retry "$PR11_URL"
+MERGE_COMMIT_SHA11=$(gh pr view "$PR11_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+echo >&2 "PR #$PR11_NUM merged. Squash commit SHA: $MERGE_COMMIT_SHA11"
+
+echo >&2 "Waiting for workflow..."
+if ! wait_for_workflow "$PR11_NUM" "feature11" "$MERGE_COMMIT_SHA11" "success"; then
+    echo >&2 "Workflow for PR11 merge did not complete successfully."
+    exit 1
+fi
+
+# 28. Verify mixed outcome
+echo >&2 "28. Verifying mixed outcome..."
+log_cmd git fetch origin
+
+# feature11 branch should still exist (feature12 is conflicted)
+if git show-ref --verify --quiet refs/remotes/origin/feature11; then
+    echo >&2 "✅ Verification Passed: Remote branch 'origin/feature11' still exists (kept for conflicted PR12)."
+else
+    echo >&2 "❌ Verification Failed: Remote branch 'origin/feature11' was deleted prematurely."
+    exit 1
+fi
+
+# PR13 (clean child) should have main as base
+PR13_BASE=$(gh pr view "$PR13_NUM" --repo "$REPO_FULL_NAME" --json baseRefName --jq .baseRefName)
+if [[ "$PR13_BASE" == "main" ]]; then
+    echo >&2 "✅ Verification Passed: PR #$PR13_NUM (clean child) base updated to 'main'."
+else
+    echo >&2 "❌ Verification Failed: PR #$PR13_NUM base is '$PR13_BASE', expected 'main'."
+    exit 1
+fi
+
+# PR13 should not have conflict label
+PR13_LABEL=$(gh pr view "$PR13_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
+if [[ -z "$PR13_LABEL" ]]; then
+    echo >&2 "✅ Verification Passed: PR #$PR13_NUM has no conflict label."
+else
+    echo >&2 "❌ Verification Failed: PR #$PR13_NUM has conflict label."
+    exit 1
+fi
+
+# PR13 diff should be preserved (compare_diffs strips blob SHAs which change with the base)
+PR13_DIFF_AFTER=$(get_pr_diff "$PR13_URL")
+compare_diffs "$PR13_DIFF_BEFORE" "$PR13_DIFF_AFTER" "PR13 diff preserved after mixed outcome"
+
+# PR12 (conflicting child) should still have feature11 as base
+PR12_BASE=$(gh pr view "$PR12_NUM" --repo "$REPO_FULL_NAME" --json baseRefName --jq .baseRefName)
+if [[ "$PR12_BASE" == "feature11" ]]; then
+    echo >&2 "✅ Verification Passed: PR #$PR12_NUM (conflicted child) base stays 'feature11'."
+else
+    echo >&2 "❌ Verification Failed: PR #$PR12_NUM base is '$PR12_BASE', expected 'feature11'."
+    exit 1
+fi
+
+# PR12 should have conflict label
+PR12_LABEL=$(gh pr view "$PR12_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
+if [[ "$PR12_LABEL" == "autorestack-needs-conflict-resolution" ]]; then
+    echo >&2 "✅ Verification Passed: PR #$PR12_NUM has conflict label."
+else
+    echo >&2 "❌ Verification Failed: PR #$PR12_NUM does not have conflict label."
+    exit 1
+fi
+
+echo >&2 "--- Multi-child Mixed Outcome Scenario Test Completed Successfully ---"
+
+
+# --- SCENARIO 6: No direct children (0-child run) ---
+# ===================================================================================
+# Tests that merging a PR with no children completes successfully and simply
+# deletes the merged branch.
+#
+# Setup:
+#   - Create main <- feature14 with no children
+#
+# Expected Behavior:
+#   - Action runs and completes with success
+#   - feature14 branch is deleted
+# ===================================================================================
+
+echo >&2 "--- Testing No Children Scenario ---"
+
+echo >&2 "29. Creating standalone PR with no children..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+log_cmd git checkout -b feature14 main
+sed -i '2s/.*/Feature 14 content line 2/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 14"
+log_cmd git push origin feature14
+PR14_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature14 --title "Feature 14" --body "This is PR 14, no children")
+PR14_NUM=$(echo "$PR14_URL" | awk -F'/' '{print $NF}')
+echo >&2 "Created PR #$PR14_NUM: $PR14_URL"
+
+# 30. Merge feature14
+echo >&2 "30. Squash merging PR #$PR14_NUM (feature14, no children)..."
+merge_pr_with_retry "$PR14_URL"
+MERGE_COMMIT_SHA14=$(gh pr view "$PR14_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+echo >&2 "PR #$PR14_NUM merged. Squash commit SHA: $MERGE_COMMIT_SHA14"
+
+echo >&2 "Waiting for workflow..."
+if ! wait_for_workflow "$PR14_NUM" "feature14" "$MERGE_COMMIT_SHA14" "success"; then
+    echo >&2 "Workflow for PR14 merge did not complete successfully."
+    exit 1
+fi
+
+# 31. Verify branch was deleted and nothing broke
+echo >&2 "31. Verifying no-children outcome..."
+log_cmd git fetch origin --prune
+
+if git show-ref --verify --quiet refs/remotes/origin/feature14; then
+    echo >&2 "❌ Verification Failed: Remote branch 'origin/feature14' still exists."
+    exit 1
+else
+    echo >&2 "✅ Verification Passed: Remote branch 'origin/feature14' was deleted."
+fi
+
+echo >&2 "--- No Children Scenario Test Completed Successfully ---"
 
 
 # --- Test Succeeded ---
