@@ -93,8 +93,7 @@ update_direct_target() {
             echo
             echo -n "I tried to merge "
             format_branch_list_for_text "${CONFLICTS[@]}"
-            echo
-            echo "into this branch while updating the PR stack and hit conflicts."
+            echo " into this branch while updating the pull request stack and hit conflicts."
             echo
             echo "#### How to resolve"
             echo '```bash'
@@ -109,6 +108,8 @@ update_direct_target() {
             done
             echo "git push"
             echo '```'
+            echo
+            echo "Once you push, this action will resume and finish updating this pull request."
         } | log_cmd gh pr comment "$BRANCH" -F -
         # Create the label if it doesn't exist, then add it to the PR
         gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
