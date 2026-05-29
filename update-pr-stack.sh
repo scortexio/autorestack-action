@@ -45,17 +45,6 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
-format_branch_list_for_text() {
-    for ((i=1; i<=$#; i++)); do
-        case $i in
-            1) format='`%s`';;
-            $#) format=', and `%s`';;
-            *) format=', `%s`';;
-        esac
-        printf "$format" "${!i}"
-    done
-}
-
 update_direct_target() {
     local BRANCH="$1"
     local BASE_BRANCH="$2"
@@ -91,23 +80,20 @@ update_direct_target() {
         {
             echo "### ⚠️ Automatic update blocked by merge conflicts"
             echo
-            echo -n "I tried to merge "
-            format_branch_list_for_text "${CONFLICTS[@]}"
-            echo " into this branch while updating the pull request stack and hit conflicts."
+            echo "I hit a merge conflict while updating this pull request after its base branch was squash-merged. Please resolve it by hand by running these in order:"
             echo
             echo "#### How to resolve"
             echo '```bash'
             echo "git fetch origin"
             echo "git switch $BRANCH"
-            for conflict in "${CONFLICTS[@]}"; do
-                echo "git merge $conflict"
-                echo "# ..."
-                echo '# fix conflicts, for instance with `git mergetool`'
-                echo "# ..."
-                echo "git commit"
-            done
+            echo "git merge origin/$MERGED_BRANCH"
+            echo "git merge $(git rev-parse SQUASH_COMMIT~)"
+            echo "# record the squash commit as merged without re-applying its changes:"
+            echo "git merge -s ours $(git rev-parse SQUASH_COMMIT)"
             echo "git push"
             echo '```'
+            echo
+            echo 'If a merge stops with conflicts, fix them (for instance with `git mergetool`), `git commit`, then run the next command.'
             echo
             echo "Once you push, this action will resume and finish updating this pull request."
         } | log_cmd gh pr comment "$BRANCH" -F -

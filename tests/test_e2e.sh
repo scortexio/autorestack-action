@@ -878,32 +878,37 @@ else
 fi
 
 
-# 12. Resolve conflict manually
-echo >&2 "12. Resolving conflict manually on feature3..."
+# 12. Resolve the conflict by following the comment the action posted.
+echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
 log_cmd git checkout feature3
-# Ensure we have the latest main which includes the PR2 merge commit AND the conflicting change on main
 log_cmd git fetch origin
-# Now, perform the merge that the action tried and failed
-echo >&2 "Attempting merge of origin/main into feature3..."
-if git merge origin/main; then
-    echo >&2 "❌ Conflict Resolution Failed: Merge of main into feature3 succeeded unexpectedly (no conflict?)"
-    log_cmd git status
-    log_cmd git log --graph --oneline --all
+# Run the merge commands from the comment verbatim, resolving any conflict by
+# keeping feature3's side. Following the comment must leave feature3 cleanly
+# mergeable into its new base; otherwise the synchronize-triggered continuation
+# can never make progress and the conflict label stays stuck.
+COMMENT_MERGES=$(echo "$CONFLICT_COMMENT" | grep -E '^git merge' || true)
+if [[ -z "$COMMENT_MERGES" ]]; then
+    echo >&2 "❌ Verification Failed: conflict comment lists no 'git merge' commands to follow."
+    echo >&2 "$CONFLICT_COMMENT"
     exit 1
-else
-    echo >&2 "Merge conflict occurred as expected. Resolving..."
-    # Check status to confirm conflict
-    log_cmd git status
-    # Resolve conflict - keep feature3's version (ours) of the conflicting file
-    # This preserves both line 2 (Feature 3 content) and line 7 (Feature 3 conflicting change)
-    log_cmd git checkout --ours file.txt
-    echo "Resolved file.txt content:"
-    cat file.txt
-    log_cmd git add file.txt
-    # Use 'git commit' without '-m' to use the default merge commit message
-    log_cmd git commit --no-edit
-    echo >&2 "Conflict resolved and committed."
 fi
+HIT_CONFLICT=false
+while IFS= read -r cmd; do
+    echo >&2 "Following comment: $cmd"
+    if ! log_cmd bash -c "$cmd"; then
+        echo >&2 "Conflict during '$cmd'; resolving by keeping feature3's side..."
+        log_cmd git checkout --ours file.txt
+        log_cmd git add file.txt
+        log_cmd git commit --no-edit
+        HIT_CONFLICT=true
+    fi
+done <<< "$COMMENT_MERGES"
+if [[ "$HIT_CONFLICT" != "true" ]]; then
+    echo >&2 "❌ Verification Failed: following the comment hit no conflict; scenario expected one."
+    exit 1
+fi
+echo >&2 "Resolved file.txt content:"
+cat file.txt
 log_cmd git push origin feature3
 echo >&2 "Pushed resolved feature3."
 
