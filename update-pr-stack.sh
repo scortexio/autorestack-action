@@ -73,9 +73,11 @@ update_direct_target() {
     echo "Updating direct target $BRANCH (from $MERGED_BRANCH to $BASE_BRANCH)"
 
     CONFLICTS=()
+    local BASE_MERGE_CLEAN=true
     log_cmd git update-ref BEFORE_MERGE HEAD
     if ! log_cmd git merge --no-edit "origin/$MERGED_BRANCH"; then
         CONFLICTS+=("origin/$MERGED_BRANCH")
+        BASE_MERGE_CLEAN=false
         log_cmd git merge --abort
     fi
     # Only try merging the pre-squash target state if it's not already
@@ -88,6 +90,17 @@ update_direct_target() {
     fi
 
     if [[ "${#CONFLICTS[@]}" -gt 0 ]]; then
+        # When the base-branch merge was clean, HEAD now holds it (the
+        # conflicting pre-squash merge was aborted back to it). Push it before
+        # asking for help: the user resolves on top of it, and the head stays a
+        # descendant of its base so the PR stays mergeable and the synchronize
+        # event that resumes this action still fires. GitHub does not run
+        # pull_request workflows on a PR conflicting with its base, which would
+        # otherwise strand the branch for good. If the base merge itself
+        # conflicted we have nothing safe to pre-push, so we just ask for help.
+        if [[ "$BASE_MERGE_CLEAN" == true ]]; then
+            log_cmd git push origin "$BRANCH"
+        fi
         {
             echo "### ⚠️ Automatic update blocked by merge conflicts"
             echo
@@ -177,15 +190,35 @@ continue_after_resolution() {
     OLD_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
     echo "Current base branch: $OLD_BASE"
 
-    # Find where the old base was merged to (the new target)
-    local NEW_TARGET
+    # The synchronize payload is the child PR, so SQUASH_COMMIT / MERGED_BRANCH /
+    # TARGET_BRANCH from the original squash-merge run are not in the environment.
+    # Reconstruct them from the merged parent PR: OLD_BASE is the parent branch,
+    # and the merged PR whose head is OLD_BASE gives the new target (its base) and
+    # the squash commit (its merge commit).
+    local NEW_TARGET SQUASH_HASH
     NEW_TARGET=$(gh pr list --head "$OLD_BASE" --state merged --json baseRefName --jq '.[0].baseRefName')
+    SQUASH_HASH=$(gh pr list --head "$OLD_BASE" --state merged --json mergeCommit --jq '.[0].mergeCommit.oid')
 
-    if [[ -z "$NEW_TARGET" ]]; then
+    if [[ -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
         echo "⚠️ Could not find where '$OLD_BASE' was merged to; skipping base branch and deletion updates"
         # Don't update base or delete old branch - leave things as they are
     else
-        echo "Old base '$OLD_BASE' was merged to '$NEW_TARGET'"
+        echo "Old base '$OLD_BASE' was merged to '$NEW_TARGET' as $SQUASH_HASH"
+
+        # The squash-merge run pushed the base merge and asked the user to resolve
+        # the pre-squash merge, but it never recorded the squash itself. Finish
+        # that now: re-run the same merge sequence as the squash-merge path. With
+        # the user's resolution in place the base merge and pre-squash merge are
+        # no-ops; only the "-s ours" squash record gets applied, keeping the diff
+        # against the new base clean. has_squash_commit makes this idempotent.
+        log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
+        MERGED_BRANCH="$OLD_BASE"
+        TARGET_BRANCH="$NEW_TARGET"
+        if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
+            echo "⚠️ Unexpected conflict while recording the squash on '$PR_BRANCH'; leaving it for manual handling"
+            return 1
+        fi
+        log_cmd git push origin "$PR_BRANCH"
 
         # Remove the conflict label
         log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
