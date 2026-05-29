@@ -865,45 +865,79 @@ else
     exit 1
 fi
 
-# Verify feature3 branch was NOT pushed with conflicts (check its head SHA)
+# The base-branch merge (feature2 into feature3) is clean here; only the
+# pre-squash merge conflicts. The action pushes that clean base merge before
+# commenting, so feature3 stays a descendant of its base (mergeable, so the
+# synchronize event that resumes the action keeps firing). Verify the push
+# happened and that it only fast-forwarded on top of the pre-conflict head.
 REMOTE_FEATURE3_SHA_BEFORE_RESOLVE=$(log_cmd git rev-parse "refs/remotes/origin/feature3")
-# The action failed the merge locally, so it shouldn't have pushed feature3.
-# The remote SHA should still be the one from step 8 ("Conflict: Modify line 3 on feature3").
-EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE=$FEATURE3_CONFLICT_COMMIT_SHA
-if [[ "$REMOTE_FEATURE3_SHA_BEFORE_RESOLVE" == "$EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE" ]]; then
-     echo >&2 "✅ Verification Passed: Remote feature3 branch was not updated by the action due to conflict."
+if log_cmd git merge-base --is-ancestor "$FEATURE3_CONFLICT_COMMIT_SHA" "refs/remotes/origin/feature3" \
+   && [[ "$REMOTE_FEATURE3_SHA_BEFORE_RESOLVE" != "$FEATURE3_CONFLICT_COMMIT_SHA" ]]; then
+    echo >&2 "✅ Verification Passed: action pushed the clean base merge on top of feature3 (still a descendant of its pre-conflict head)."
 else
-     echo >&2 "❌ Verification Failed: Remote feature3 branch SHA ($REMOTE_FEATURE3_SHA_BEFORE_RESOLVE) differs from expected SHA before conflict resolution ($EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE)."
-     exit 1
+    echo >&2 "❌ Verification Failed: expected origin/feature3 to advance from $FEATURE3_CONFLICT_COMMIT_SHA with the pushed base merge, got $REMOTE_FEATURE3_SHA_BEFORE_RESOLVE."
+    log_cmd git log --graph --oneline origin/feature3 origin/feature2
+    exit 1
 fi
-
-
-# 12. Resolve conflict manually
-echo >&2 "12. Resolving conflict manually on feature3..."
-log_cmd git checkout feature3
-# Ensure we have the latest main which includes the PR2 merge commit AND the conflicting change on main
-log_cmd git fetch origin
-# Now, perform the merge that the action tried and failed
-echo >&2 "Attempting merge of origin/main into feature3..."
-if git merge origin/main; then
-    echo >&2 "❌ Conflict Resolution Failed: Merge of main into feature3 succeeded unexpectedly (no conflict?)"
-    log_cmd git status
-    log_cmd git log --graph --oneline --all
+# The base merge brought feature2's updated state into feature3...
+if log_cmd git merge-base --is-ancestor "refs/remotes/origin/feature2" "refs/remotes/origin/feature3"; then
+    echo >&2 "✅ Verification Passed: origin/feature3 contains origin/feature2 (the pushed base merge)."
+else
+    echo >&2 "❌ Verification Failed: origin/feature3 does not contain origin/feature2 after the push."
+    exit 1
+fi
+# ...and the comment must ask only for the genuine conflict (the pre-squash
+# merge), not the base merge the action already did and pushed.
+if echo "$CONFLICT_COMMENT" | grep -q "^git merge origin/feature2"; then
+    echo >&2 "❌ Verification Failed: comment asks the user to merge origin/feature2, which the action already pushed."
+    echo >&2 "$CONFLICT_COMMENT"
     exit 1
 else
-    echo >&2 "Merge conflict occurred as expected. Resolving..."
-    # Check status to confirm conflict
-    log_cmd git status
-    # Resolve conflict - keep feature3's version (ours) of the conflicting file
-    # This preserves both line 2 (Feature 3 content) and line 7 (Feature 3 conflicting change)
-    log_cmd git checkout --ours file.txt
-    echo "Resolved file.txt content:"
-    cat file.txt
-    log_cmd git add file.txt
-    # Use 'git commit' without '-m' to use the default merge commit message
-    log_cmd git commit --no-edit
-    echo >&2 "Conflict resolved and committed."
+    echo >&2 "✅ Verification Passed: comment omits the base merge the action already pushed."
 fi
+
+
+# 12. Resolve the conflict by following the comment the action posted.
+echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
+log_cmd git fetch origin
+log_cmd git checkout feature3
+# The action pushed the clean base merge to feature3, so the local branch is now
+# behind origin. The comment tells the user to fast-forward to it before merging;
+# skipping that would leave the resolution on a stale head and the final push
+# would be rejected as non-fast-forward. Verify the comment carries that step,
+# then run it. Following the comment must leave feature3 cleanly mergeable into
+# its new base, or the synchronize-triggered continuation can never make progress
+# and the conflict label stays stuck.
+if ! echo "$CONFLICT_COMMENT" | grep -q "^git pull --ff-only origin feature3"; then
+    echo >&2 "❌ Verification Failed: comment does not tell the user to re-sync (git pull --ff-only origin feature3)."
+    echo >&2 "$CONFLICT_COMMENT"
+    exit 1
+fi
+log_cmd git pull --ff-only origin feature3
+COMMENT_MERGES=$(echo "$CONFLICT_COMMENT" | grep -E '^git merge' || true)
+if [[ -z "$COMMENT_MERGES" ]]; then
+    echo >&2 "❌ Verification Failed: conflict comment lists no 'git merge' commands to follow."
+    echo >&2 "$CONFLICT_COMMENT"
+    exit 1
+fi
+HIT_CONFLICT=false
+while IFS= read -r cmd; do
+    echo >&2 "Following comment: $cmd"
+    if ! log_cmd bash -c "$cmd"; then
+        echo >&2 "Conflict during '$cmd'; resolving by keeping feature3's side..."
+        # Keep feature3's line 2 and line 7 conflicting change.
+        log_cmd git checkout --ours file.txt
+        log_cmd git add file.txt
+        log_cmd git commit --no-edit
+        HIT_CONFLICT=true
+    fi
+done <<< "$COMMENT_MERGES"
+if [[ "$HIT_CONFLICT" != "true" ]]; then
+    echo >&2 "❌ Verification Failed: following the comment hit no conflict; scenario expected one."
+    exit 1
+fi
+echo >&2 "Resolved file.txt content:"
+cat file.txt
 log_cmd git push origin feature3
 echo >&2 "Pushed resolved feature3."
 

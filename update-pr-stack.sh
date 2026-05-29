@@ -112,6 +112,15 @@ update_direct_target() {
             echo '```bash'
             echo "git fetch origin"
             echo "git switch $BRANCH"
+            # When the base merge was clean we already pushed it to this branch,
+            # so the local branch is now behind origin. Fast-forward to it before
+            # resolving, otherwise the final push is rejected as non-fast-forward.
+            # The line is a harmless no-op on the fallback path (nothing pushed).
+            if [[ "$BASE_MERGE_CLEAN" == true ]]; then
+                echo "git pull --ff-only origin $BRANCH  # pick up the base merge this action already pushed"
+            else
+                echo "git pull --ff-only origin $BRANCH"
+            fi
             for conflict in "${CONFLICTS[@]}"; do
                 echo "git merge $conflict"
                 echo "# ..."
