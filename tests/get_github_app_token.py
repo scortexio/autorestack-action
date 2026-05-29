@@ -10,12 +10,14 @@
 """
 GitHub App Token Generator with caching
 
-Generates an installation access token from GitHub App credentials in environment.
+Generates an installation access token from GitHub App credentials.
 Caches tokens and reuses them until they expire (with 5-minute buffer).
 
 Environment variables required:
 - GH_APP_ID: GitHub App ID
-- GH_APP_PRIVATE_KEY: PEM private key
+
+Files required:
+- .gh-app-private-key.pem: PEM private key
 
 Usage:
     # Run with uv (automatically installs dependencies)
@@ -40,6 +42,7 @@ import requests
 
 # Cache file location
 CACHE_FILE = Path("/tmp/gh_app_token_cache.json")
+PRIVATE_KEY_FILE = Path(__file__).resolve().parents[1] / ".gh-app-private-key.pem"
 # Buffer time before expiration (5 minutes)
 EXPIRATION_BUFFER_SECONDS = 300
 
@@ -96,13 +99,17 @@ def save_token_to_cache(token, expires_at):
 
 def generate_installation_token():
     """Generate a new installation access token for the GitHub App."""
-    # Get credentials from environment
     app_id = os.getenv("GH_APP_ID")
-    private_key = os.getenv("GH_APP_PRIVATE_KEY")
 
-    if not all([app_id, private_key]):
-        print("Error: Missing GH_APP_ID or GH_APP_PRIVATE_KEY", file=sys.stderr)
+    if not app_id:
+        print("Error: Missing GH_APP_ID", file=sys.stderr)
         sys.exit(1)
+
+    if not PRIVATE_KEY_FILE.exists():
+        print(f"Error: Missing private key file: {PRIVATE_KEY_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    private_key = PRIVATE_KEY_FILE.read_text()
 
     # Generate JWT
     now = int(time.time())
