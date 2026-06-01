@@ -143,6 +143,7 @@ source "$PROJECT_ROOT/command_utils.sh"
 
 # Workflow file name
 WORKFLOW_FILE="update-pr-stack.yml"
+WORKFLOW_RUN_IDS_BEFORE_TRIGGER=""
 
 # --- Helper Functions ---
 cleanup() {
@@ -308,6 +309,9 @@ follow_conflict_comment() {
         if [[ "$block" == git\ push* && -n "$before_push_hook" ]]; then
             "$before_push_hook"
         fi
+        if [[ "$block" == git\ push* ]]; then
+            record_existing_workflow_runs
+        fi
         if ! log_cmd bash -e -c "$block"; then
             if git diff --name-only --diff-filter=U | grep -qx "$conflict_file"; then
                 echo >&2 "Conflict during comment block; resolving by keeping $resolution_description..."
@@ -348,6 +352,21 @@ assert_pr_changed_lines() {
     fi
 }
 
+record_existing_workflow_runs() {
+    WORKFLOW_RUN_IDS_BEFORE_TRIGGER=$(gh run list \
+        --repo "$REPO_FULL_NAME" \
+        --workflow "$WORKFLOW_FILE" \
+        --event pull_request \
+        --limit 30 \
+        --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+}
+
+is_recorded_workflow_run() {
+    local run_id=$1
+
+    grep -qx "$run_id" <<< "$WORKFLOW_RUN_IDS_BEFORE_TRIGGER"
+}
+
 # Wait for a PR's base branch to change to the expected value.
 # Uses retry loop instead of arbitrary sleep.
 wait_for_pr_base_change() {
@@ -385,6 +404,8 @@ merge_pr_with_retry() {
     local max_attempts=5
     local attempt=0
 
+    record_existing_workflow_runs
+
     while [[ $attempt -lt $max_attempts ]]; do
         attempt=$((attempt + 1))
         echo >&2 "Merge attempt $attempt/$max_attempts for $pr_url..."
@@ -412,7 +433,7 @@ wait_for_synchronize_workflow() {
     local max_attempts=20 # ~7 mins max wait
     local attempt=0
     local target_run_id=""
-    local start_time=$(date +%s)
+    local expected_run_name="synchronize PR #$pr_number"
 
     echo >&2 "Waiting for workflow '$WORKFLOW_FILE' triggered by synchronize event on PR #$pr_number (branch $branch_name)..."
 
@@ -428,7 +449,7 @@ wait_for_synchronize_workflow() {
                 --workflow "$WORKFLOW_FILE" \
                 --event pull_request \
                 --limit 15 \
-                --json databaseId,createdAt --jq '.[] | select(.createdAt >= "'$(date -u -d "@$start_time" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r $start_time +%Y-%m-%dT%H:%M:%SZ)'") | .databaseId' || echo "")
+                --json databaseId --jq '.[].databaseId' || echo "")
 
             if [[ -z "$candidate_run_ids" ]]; then
                 echo >&2 "No recent '$WORKFLOW_FILE' runs found since start. Sleeping $sleep_time seconds."
@@ -439,15 +460,21 @@ wait_for_synchronize_workflow() {
 
             echo >&2 "Found candidate run IDs: $candidate_run_ids. Checking runs..."
             for run_id in $candidate_run_ids; do
+                if is_recorded_workflow_run "$run_id"; then
+                    echo >&2 "Skipping workflow run ID $run_id because it existed before this trigger."
+                    continue
+                fi
                 echo >&2 "Checking candidate run ID: $run_id"
-                run_info=$(log_cmd gh run view "$run_id" --repo "$REPO_FULL_NAME" --json headBranch || echo "{}")
+                run_info=$(log_cmd gh run view "$run_id" --repo "$REPO_FULL_NAME" --json displayTitle,headBranch || echo "{}")
 
+                run_display_title=$(echo "$run_info" | jq -r '.displayTitle // ""')
                 run_head_branch=$(echo "$run_info" | jq -r '.headBranch // ""')
 
+                echo >&2 "  Run display title: $run_display_title"
                 echo >&2 "  Run head branch: $run_head_branch"
 
-                if [[ "$run_head_branch" == "$branch_name" ]]; then
-                    echo >&2 "Found matching workflow run ID: $run_id (branch matches)"
+                if [[ "$run_display_title" == "$expected_run_name"* && "$run_head_branch" == "$branch_name" ]]; then
+                    echo >&2 "Found matching workflow run ID: $run_id (run name and branch match)"
                     target_run_id="$run_id"
                     break
                 fi
@@ -503,6 +530,7 @@ wait_for_workflow() {
     local max_attempts=20 # Increased attempts (~7 mins max wait)
     local attempt=0
     local target_run_id=""
+    local expected_run_name="closed PR #$pr_number"
 
     echo >&2 "Waiting for workflow '$WORKFLOW_FILE' triggered by merge of PR #$pr_number (merge commit $merge_commit_sha)..."
 
@@ -519,8 +547,8 @@ wait_for_workflow() {
                 --repo "$REPO_FULL_NAME" \
                 --workflow "$WORKFLOW_FILE" \
                 --event pull_request \
-                --limit 10 \
-                --json databaseId --jq '.[].databaseId' || echo "") # Get IDs, handle potential errors
+                --limit 15 \
+                --json databaseId --jq '.[].databaseId' || echo "")
 
             if [[ -z "$candidate_run_ids" ]]; then
                 echo >&2 "No recent '$WORKFLOW_FILE' runs found for 'pull_request' event. Sleeping $sleep_time seconds."
@@ -531,20 +559,26 @@ wait_for_workflow() {
 
             echo >&2 "Found candidate run IDs: $candidate_run_ids. Checking runs..."
             for run_id in $candidate_run_ids; do
+                if is_recorded_workflow_run "$run_id"; then
+                    echo >&2 "Skipping workflow run ID $run_id because it existed before this trigger."
+                    continue
+                fi
                 echo >&2 "Checking candidate run ID: $run_id"
-                run_info=$(log_cmd gh run view "$run_id" --repo "$REPO_FULL_NAME" --json headBranch,headSha || echo "{}") # Fetch run info, default to empty JSON on error
+                run_info=$(log_cmd gh run view "$run_id" --repo "$REPO_FULL_NAME" --json displayTitle,headBranch,headSha || echo "{}") # Fetch run info, default to empty JSON on error
 
                 # Check if the run matches our merged branch
+                run_display_title=$(echo "$run_info" | jq -r '.displayTitle // ""')
                 run_head_branch=$(echo "$run_info" | jq -r '.headBranch // ""')
                 run_head_sha=$(echo "$run_info" | jq -r '.headSha // ""')
 
+                echo >&2 "  Run display title: $run_display_title"
                 echo >&2 "  Run head branch: $run_head_branch, head SHA: $run_head_sha"
                 echo >&2 "  Expected merged branch: $merged_branch_name, merge commit SHA: $merge_commit_sha"
 
                 # For pull_request events, the workflow runs on the PR's head branch
-                # Match by the head branch being the merged branch name
-                if [[ "$run_head_branch" == "$merged_branch_name" ]]; then
-                    echo >&2 "Found matching workflow run ID: $run_id (headBranch matches merged branch)"
+                # Match by the run name event action and the head branch.
+                if [[ "$run_display_title" == "$expected_run_name"* && "$run_head_branch" == "$merged_branch_name" ]]; then
+                    echo >&2 "Found matching workflow run ID: $run_id (run name and headBranch match)"
                     target_run_id="$run_id"
                     break # Found the run, exit the inner loop
                 else
