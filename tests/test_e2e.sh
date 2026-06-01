@@ -71,9 +71,10 @@
 #   - Squash merge PR2 (feature2) into main
 #
 # Expected Behavior:
-#   - The action attempts to merge main into feature3
-#   - Detects a merge conflict (both modified line 7 differently)
-#   - Does NOT push any conflicted state to the remote
+#   - The action merges feature2 into feature3 if that clean base merge is safe
+#   - Detects a merge conflict with the pre-squash target state (both modified
+#     line 7 differently)
+#   - Pushes only the clean base merge, never any conflicted state
 #   - Posts a comment on PR3 explaining the conflict
 #   - Adds a label "autorestack-needs-conflict-resolution" to PR3
 #   - Does NOT update PR3's base branch (keeps it as feature2 for readable diff)
@@ -85,11 +86,11 @@
 #   - PR3 base branch stays as feature2 (not updated to main)
 #   - Conflict comment exists on PR3
 #   - Conflict label "autorestack-needs-conflict-resolution" exists on PR3
-#   - feature3 branch was NOT updated (still at pre-conflict SHA)
+#   - feature3 branch advanced only by the clean base merge
 #
 # Manual Conflict Resolution (Steps 12-15):
 #   - Test simulates user resolving the conflict manually
-#   - Merge main into feature3, resolve conflict (keep feature3's changes)
+#   - Follow the posted comment, resolve conflict (keep feature3's changes)
 #   - Push the resolved branch
 #   - The push triggers the 'synchronize' event on PR3
 #   - The action detects the conflict label and removes it
@@ -203,6 +204,62 @@ compare_diffs() {
         echo "$diff2" >&2
         echo >&2 "--------------------"
         return 1
+    fi
+}
+
+get_conflict_comment() {
+    local pr_url=$1
+    local pr_number=$2
+    local comment
+
+    comment=$(log_cmd gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '.comments[] | select(.body | contains("Automatic update blocked by merge conflicts")) | .body')
+    if [[ -n "$comment" ]]; then
+        echo >&2 "✅ Verification Passed: Conflict comment found on PR #$pr_number."
+        echo "$comment" >&2
+    else
+        echo >&2 "❌ Verification Failed: Conflict comment not found on PR #$pr_number."
+        echo >&2 "--- Comments on PR #$pr_number ---"
+        gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '.comments[].body' || echo "Failed to get comments"
+        echo >&2 "-----------------------------"
+        exit 1
+    fi
+
+    printf '%s\n' "$comment"
+}
+
+follow_conflict_comment() {
+    local comment=$1
+    local branch=$2
+    local conflict_file=$3
+    local resolution_description=$4
+    local comment_merges
+    local hit_conflict=false
+
+    log_cmd git fetch origin
+    log_cmd git checkout "$branch"
+    log_cmd git pull origin "$branch"
+
+    comment_merges=$(echo "$comment" | grep -E '^git merge' || true)
+    if [[ -z "$comment_merges" ]]; then
+        echo >&2 "❌ Verification Failed: conflict comment lists no 'git merge' commands to follow."
+        echo >&2 "$comment"
+        exit 1
+    fi
+
+    while IFS= read -r cmd; do
+        echo >&2 "Following comment: $cmd"
+        if ! log_cmd bash -c "$cmd"; then
+            echo >&2 "Conflict during '$cmd'; resolving by keeping $resolution_description..."
+            log_cmd git checkout --ours "$conflict_file"
+            log_cmd git add "$conflict_file"
+            log_cmd git commit --no-edit
+            hit_conflict=true
+        fi
+    done <<< "$comment_merges"
+
+    if [[ "$hit_conflict" != "true" ]]; then
+        echo >&2 "❌ Verification Failed: following the comment hit no conflict; scenario expected one."
+        exit 1
     fi
 }
 
@@ -840,17 +897,7 @@ fi
 echo >&2 "Checking for conflict comment on PR #$PR3_NUM..."
 # Give GitHub some time to process the comment
 sleep 5
-CONFLICT_COMMENT=$(log_cmd gh pr view "$PR3_URL" --repo "$REPO_FULL_NAME" --json comments --jq '.comments[] | select(.body | contains("Automatic update blocked by merge conflicts")) | .body')
-if [[ -n "$CONFLICT_COMMENT" ]]; then
-    echo >&2 "✅ Verification Passed: Conflict comment found on PR #$PR3_NUM."
-    echo "$CONFLICT_COMMENT" # Log the comment
-else
-    echo >&2 "❌ Verification Failed: Conflict comment not found on PR #$PR3_NUM."
-    echo >&2 "--- Comments on PR #$PR3_NUM ---"
-    gh pr view "$PR3_URL" --repo "$REPO_FULL_NAME" --json comments --jq '.comments[].body' || echo "Failed to get comments"
-    echo >&2 "-----------------------------"
-    exit 1
-fi
+CONFLICT_COMMENT=$(get_conflict_comment "$PR3_URL" "$PR3_NUM")
 
 # Verify conflict label exists on PR3
 echo >&2 "Checking for conflict label on PR #$PR3_NUM..."
@@ -865,45 +912,50 @@ else
     exit 1
 fi
 
-# Verify feature3 branch was NOT pushed with conflicts (check its head SHA)
+# The base-branch merge (feature2 into feature3) is clean here; only the
+# pre-squash merge conflicts. The action pushes that clean base merge before
+# commenting, so feature3 stays a descendant of its base (mergeable, so the
+# synchronize event that resumes the action keeps firing). Verify the push
+# happened and that it only fast-forwarded on top of the pre-conflict head.
 REMOTE_FEATURE3_SHA_BEFORE_RESOLVE=$(log_cmd git rev-parse "refs/remotes/origin/feature3")
-# The action failed the merge locally, so it shouldn't have pushed feature3.
-# The remote SHA should still be the one from step 8 ("Conflict: Modify line 3 on feature3").
-EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE=$FEATURE3_CONFLICT_COMMIT_SHA
-if [[ "$REMOTE_FEATURE3_SHA_BEFORE_RESOLVE" == "$EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE" ]]; then
-     echo >&2 "✅ Verification Passed: Remote feature3 branch was not updated by the action due to conflict."
+if log_cmd git merge-base --is-ancestor "$FEATURE3_CONFLICT_COMMIT_SHA" "refs/remotes/origin/feature3" \
+   && [[ "$REMOTE_FEATURE3_SHA_BEFORE_RESOLVE" != "$FEATURE3_CONFLICT_COMMIT_SHA" ]]; then
+    echo >&2 "✅ Verification Passed: action pushed the clean base merge on top of feature3 (still a descendant of its pre-conflict head)."
 else
-     echo >&2 "❌ Verification Failed: Remote feature3 branch SHA ($REMOTE_FEATURE3_SHA_BEFORE_RESOLVE) differs from expected SHA before conflict resolution ($EXPECTED_FEATURE3_SHA_BEFORE_RESOLVE)."
-     exit 1
+    echo >&2 "❌ Verification Failed: expected origin/feature3 to advance from $FEATURE3_CONFLICT_COMMIT_SHA with the pushed base merge, got $REMOTE_FEATURE3_SHA_BEFORE_RESOLVE."
+    log_cmd git log --graph --oneline origin/feature3 origin/feature2
+    exit 1
 fi
-
-
-# 12. Resolve conflict manually
-echo >&2 "12. Resolving conflict manually on feature3..."
-log_cmd git checkout feature3
-# Ensure we have the latest main which includes the PR2 merge commit AND the conflicting change on main
-log_cmd git fetch origin
-# Now, perform the merge that the action tried and failed
-echo >&2 "Attempting merge of origin/main into feature3..."
-if git merge origin/main; then
-    echo >&2 "❌ Conflict Resolution Failed: Merge of main into feature3 succeeded unexpectedly (no conflict?)"
-    log_cmd git status
-    log_cmd git log --graph --oneline --all
+# The base merge brought feature2's updated state into feature3...
+if log_cmd git merge-base --is-ancestor "refs/remotes/origin/feature2" "refs/remotes/origin/feature3"; then
+    echo >&2 "✅ Verification Passed: origin/feature3 contains origin/feature2 (the pushed base merge)."
+else
+    echo >&2 "❌ Verification Failed: origin/feature3 does not contain origin/feature2 after the push."
+    exit 1
+fi
+# ...and the comment must ask only for the genuine conflict (the pre-squash
+# merge), not the base merge the action already did and pushed.
+if echo "$CONFLICT_COMMENT" | grep -q "^git merge origin/feature2"; then
+    echo >&2 "❌ Verification Failed: comment asks the user to merge origin/feature2, which the action already pushed."
+    echo >&2 "$CONFLICT_COMMENT"
     exit 1
 else
-    echo >&2 "Merge conflict occurred as expected. Resolving..."
-    # Check status to confirm conflict
-    log_cmd git status
-    # Resolve conflict - keep feature3's version (ours) of the conflicting file
-    # This preserves both line 2 (Feature 3 content) and line 7 (Feature 3 conflicting change)
-    log_cmd git checkout --ours file.txt
-    echo "Resolved file.txt content:"
-    cat file.txt
-    log_cmd git add file.txt
-    # Use 'git commit' without '-m' to use the default merge commit message
-    log_cmd git commit --no-edit
-    echo >&2 "Conflict resolved and committed."
+    echo >&2 "✅ Verification Passed: comment omits the base merge the action already pushed."
 fi
+
+
+# 12. Resolve the conflict by following the comment the action posted.
+echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
+# The action pushed the clean base merge to feature3, so the local branch is now
+# behind origin. The comment tells the user to fast-forward to it before merging;
+# skipping that would leave the resolution on a stale head and the final push
+# would be rejected as non-fast-forward. Verify the comment carries that step,
+# then run it. Following the comment must leave feature3 cleanly mergeable into
+# its new base, or the synchronize-triggered continuation can never make progress
+# and the conflict label stays stuck.
+follow_conflict_comment "$CONFLICT_COMMENT" feature3 file.txt "feature3's side"
+echo >&2 "Resolved file.txt content:"
+cat file.txt
 log_cmd git push origin feature3
 echo >&2 "Pushed resolved feature3."
 
@@ -1117,18 +1169,26 @@ else
     exit 1
 fi
 
-# 19. Resolve first sibling (feature6) - feature5 should still be kept
-echo >&2 "19. Resolving first sibling (feature6)..."
-log_cmd git checkout feature6
-log_cmd git fetch origin
-if git merge origin/main; then
-    echo >&2 "Merge succeeded unexpectedly (no conflict?)"
-else
-    echo >&2 "Resolving conflict on feature6..."
-    log_cmd git checkout --ours file.txt
-    log_cmd git add file.txt
-    log_cmd git commit --no-edit
+# Verify both conflict comments exist and ask only for the genuine conflict.
+echo >&2 "Checking for conflict comments on PR #$PR6_NUM and PR #$PR7_NUM..."
+sleep 5
+PR6_CONFLICT_COMMENT=$(get_conflict_comment "$PR6_URL" "$PR6_NUM")
+PR7_CONFLICT_COMMENT=$(get_conflict_comment "$PR7_URL" "$PR7_NUM")
+if echo "$PR6_CONFLICT_COMMENT" | grep -q "^git merge origin/feature5"; then
+    echo >&2 "❌ Verification Failed: PR #$PR6_NUM comment asks the user to merge origin/feature5, which the action already pushed or already had."
+    echo >&2 "$PR6_CONFLICT_COMMENT"
+    exit 1
 fi
+if echo "$PR7_CONFLICT_COMMENT" | grep -q "^git merge origin/feature5"; then
+    echo >&2 "❌ Verification Failed: PR #$PR7_NUM comment asks the user to merge origin/feature5, which the action already pushed or already had."
+    echo >&2 "$PR7_CONFLICT_COMMENT"
+    exit 1
+fi
+echo >&2 "✅ Verification Passed: sibling conflict comments omit the base merge."
+
+# 19. Resolve first sibling (feature6) - feature5 should still be kept
+echo >&2 "19. Resolving first sibling (feature6) by following the posted comment..."
+follow_conflict_comment "$PR6_CONFLICT_COMMENT" feature6 file.txt "feature6's side"
 log_cmd git push origin feature6
 
 # Wait for continuation workflow
@@ -1179,17 +1239,8 @@ else
 fi
 
 # 21. Resolve second sibling (feature7) - now feature5 should be deleted
-echo >&2 "21. Resolving second sibling (feature7)..."
-log_cmd git checkout feature7
-log_cmd git fetch origin
-if git merge origin/main; then
-    echo >&2 "Merge succeeded unexpectedly (no conflict?)"
-else
-    echo >&2 "Resolving conflict on feature7..."
-    log_cmd git checkout --ours file.txt
-    log_cmd git add file.txt
-    log_cmd git commit --no-edit
-fi
+echo >&2 "21. Resolving second sibling (feature7) by following the posted comment..."
+follow_conflict_comment "$PR7_CONFLICT_COMMENT" feature7 file.txt "feature7's side"
 log_cmd git push origin feature7
 
 # Wait for continuation workflow
