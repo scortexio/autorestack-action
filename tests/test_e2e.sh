@@ -114,6 +114,11 @@
 # Tests that merging a PR with no children simply deletes the branch
 # and the action completes successfully.
 #
+# SCENARIO 7: Conflict Matrix Edge Cases (Steps 32-34)
+# ----------------------------------------------------
+# Tests base-branch conflicts, simultaneous base/trunk conflicts, and a
+# follow-up trunk conflict discovered after a base conflict is resolved.
+#
 # =============================================================================
 set -e # Exit immediately if a command exits with a non-zero status.
 # set -x # Debugging: print commands as they are executed
@@ -210,9 +215,20 @@ compare_diffs() {
 get_conflict_comment() {
     local pr_url=$1
     local pr_number=$2
+    local expected_count=${3:-}
+    local comments
     local comment
+    local count
 
-    comment=$(log_cmd gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '.comments[] | select(.body | contains("Automatic update blocked by merge conflicts")) | .body')
+    comments=$(log_cmd gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '[.comments[] | select(.body | contains("Automatic update blocked by merge conflicts")) | .body]')
+    count=$(echo "$comments" | jq 'length')
+    comment=$(echo "$comments" | jq -r '.[-1] // ""')
+    if [[ -n "$expected_count" && "$count" != "$expected_count" ]]; then
+        echo >&2 "❌ Verification Failed: PR #$pr_number has $count conflict comments, expected $expected_count."
+        echo >&2 "$comments"
+        exit 1
+    fi
+
     if [[ -n "$comment" ]]; then
         echo >&2 "✅ Verification Passed: Conflict comment found on PR #$pr_number."
         echo "$comment" >&2
@@ -227,44 +243,107 @@ get_conflict_comment() {
     printf '%s\n' "$comment"
 }
 
+assert_conflict_comment_merges() {
+    local comment=$1
+    shift
+    local expected=""
+    local actual
+
+    for conflict in "$@"; do
+        expected+="git merge $conflict"$'\n'
+    done
+    expected=${expected%$'\n'}
+    actual=$(echo "$comment" | grep -E '^git merge' || true)
+
+    if [[ "$actual" == "$expected" ]]; then
+        echo >&2 "✅ Verification Passed: conflict comment lists expected merge command(s)."
+    else
+        echo >&2 "❌ Verification Failed: conflict comment merge commands differ."
+        echo >&2 "--- Expected ---"
+        echo >&2 "$expected"
+        echo >&2 "--- Actual ---"
+        echo >&2 "$actual"
+        echo >&2 "--- Full comment ---"
+        echo >&2 "$comment"
+        exit 1
+    fi
+}
+
 follow_conflict_comment() {
     local comment=$1
-    local branch=$2
-    local conflict_file=$3
-    local resolution_description=$4
-    local comment_merges
-    local hit_conflict=false
+    local conflict_file=$2
+    local resolution_description=$3
+    local expected_conflicts=$4
+    local before_push_hook=${5:-}
+    local in_block=false
+    local block=""
+    local blocks=()
+    local hit_conflicts=0
 
-    log_cmd git fetch origin
-    log_cmd git checkout "$branch"
-
-    if ! echo "$comment" | grep -q "^git pull --ff-only origin $branch"; then
-        echo >&2 "❌ Verification Failed: comment does not tell the user to re-sync (git pull --ff-only origin $branch)."
-        echo >&2 "$comment"
-        exit 1
-    fi
-    log_cmd git pull --ff-only origin "$branch"
-
-    comment_merges=$(echo "$comment" | grep -E '^git merge' || true)
-    if [[ -z "$comment_merges" ]]; then
-        echo >&2 "❌ Verification Failed: conflict comment lists no 'git merge' commands to follow."
-        echo >&2 "$comment"
-        exit 1
-    fi
-
-    while IFS= read -r cmd; do
-        echo >&2 "Following comment: $cmd"
-        if ! log_cmd bash -c "$cmd"; then
-            echo >&2 "Conflict during '$cmd'; resolving by keeping $resolution_description..."
-            log_cmd git checkout --ours "$conflict_file"
-            log_cmd git add "$conflict_file"
-            log_cmd git commit --no-edit
-            hit_conflict=true
+    while IFS= read -r line; do
+        if [[ "$line" == '```bash' ]]; then
+            in_block=true
+            block=""
+            continue
         fi
-    done <<< "$comment_merges"
+        if [[ "$line" == '```' && "$in_block" == "true" ]]; then
+            blocks+=("${block%$'\n'}")
+            in_block=false
+            continue
+        fi
+        if [[ "$in_block" == "true" ]]; then
+            block+="$line"$'\n'
+        fi
+    done <<< "$comment"
 
-    if [[ "$hit_conflict" != "true" ]]; then
-        echo >&2 "❌ Verification Failed: following the comment hit no conflict; scenario expected one."
+    if [[ "${#blocks[@]}" -eq 0 ]]; then
+        echo >&2 "❌ Verification Failed: conflict comment contains no bash code blocks to follow."
+        echo >&2 "$comment"
+        exit 1
+    fi
+
+    for block in "${blocks[@]}"; do
+        echo >&2 "Following comment block:"
+        echo >&2 "$block"
+        if [[ "$block" == git\ push* && -n "$before_push_hook" ]]; then
+            "$before_push_hook"
+        fi
+        if ! log_cmd bash -e -c "$block"; then
+            if git diff --name-only --diff-filter=U | grep -qx "$conflict_file"; then
+                echo >&2 "Conflict during comment block; resolving by keeping $resolution_description..."
+                log_cmd git checkout --ours "$conflict_file"
+                log_cmd git add "$conflict_file"
+                log_cmd git commit --no-edit
+                hit_conflicts=$((hit_conflicts + 1))
+            else
+                echo >&2 "❌ Verification Failed: comment block failed without an unresolved $conflict_file conflict."
+                log_cmd git status
+                exit 1
+            fi
+        fi
+    done
+
+    if [[ "$hit_conflicts" -ne "$expected_conflicts" ]]; then
+        echo >&2 "❌ Verification Failed: following the comment hit $hit_conflicts conflicts; expected $expected_conflicts."
+        exit 1
+    fi
+}
+
+assert_pr_changed_lines() {
+    local pr_url=$1
+    local context=$2
+    local expected=$3
+    local actual
+
+    actual=$(get_pr_diff "$pr_url" | grep '^[+-]' | grep -v '^[+-][+-][+-]')
+    if [[ "$actual" == "$expected" ]]; then
+        echo >&2 "✅ Verification Passed: $context"
+    else
+        echo >&2 "❌ Verification Failed: $context"
+        echo >&2 "--- Expected changed lines ---"
+        echo >&2 "$expected"
+        echo >&2 "--- Actual changed lines ---"
+        echo >&2 "$actual"
         exit 1
     fi
 }
@@ -903,7 +982,9 @@ fi
 echo >&2 "Checking for conflict comment on PR #$PR3_NUM..."
 # Give GitHub some time to process the comment
 sleep 5
-CONFLICT_COMMENT=$(get_conflict_comment "$PR3_URL" "$PR3_NUM")
+CONFLICT_COMMENT=$(get_conflict_comment "$PR3_URL" "$PR3_NUM" 1)
+PRE_SQUASH_COMMIT2=$(git rev-parse "$MERGE_COMMIT_SHA2~")
+assert_conflict_comment_merges "$CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT2"
 
 # Verify conflict label exists on PR3
 echo >&2 "Checking for conflict label on PR #$PR3_NUM..."
@@ -959,10 +1040,9 @@ echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
 # then run it. Following the comment must leave feature3 cleanly mergeable into
 # its new base, or the synchronize-triggered continuation can never make progress
 # and the conflict label stays stuck.
-follow_conflict_comment "$CONFLICT_COMMENT" feature3 file.txt "feature3's side"
+follow_conflict_comment "$CONFLICT_COMMENT" file.txt "feature3's side" 1
 echo >&2 "Resolved file.txt content:"
 cat file.txt
-log_cmd git push origin feature3
 echo >&2 "Pushed resolved feature3."
 
 # 13. Wait for continuation workflow triggered by push
@@ -1178,24 +1258,15 @@ fi
 # Verify both conflict comments exist and ask only for the genuine conflict.
 echo >&2 "Checking for conflict comments on PR #$PR6_NUM and PR #$PR7_NUM..."
 sleep 5
-PR6_CONFLICT_COMMENT=$(get_conflict_comment "$PR6_URL" "$PR6_NUM")
-PR7_CONFLICT_COMMENT=$(get_conflict_comment "$PR7_URL" "$PR7_NUM")
-if echo "$PR6_CONFLICT_COMMENT" | grep -q "^git merge origin/feature5"; then
-    echo >&2 "❌ Verification Failed: PR #$PR6_NUM comment asks the user to merge origin/feature5, which the action already pushed or already had."
-    echo >&2 "$PR6_CONFLICT_COMMENT"
-    exit 1
-fi
-if echo "$PR7_CONFLICT_COMMENT" | grep -q "^git merge origin/feature5"; then
-    echo >&2 "❌ Verification Failed: PR #$PR7_NUM comment asks the user to merge origin/feature5, which the action already pushed or already had."
-    echo >&2 "$PR7_CONFLICT_COMMENT"
-    exit 1
-fi
-echo >&2 "✅ Verification Passed: sibling conflict comments omit the base merge."
+PR6_CONFLICT_COMMENT=$(get_conflict_comment "$PR6_URL" "$PR6_NUM" 1)
+PR7_CONFLICT_COMMENT=$(get_conflict_comment "$PR7_URL" "$PR7_NUM" 1)
+PRE_SQUASH_COMMIT5=$(git rev-parse "$MERGE_COMMIT_SHA5~")
+assert_conflict_comment_merges "$PR6_CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT5"
+assert_conflict_comment_merges "$PR7_CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT5"
 
 # 19. Resolve first sibling (feature6) - feature5 should still be kept
 echo >&2 "19. Resolving first sibling (feature6) by following the posted comment..."
-follow_conflict_comment "$PR6_CONFLICT_COMMENT" feature6 file.txt "feature6's side"
-log_cmd git push origin feature6
+follow_conflict_comment "$PR6_CONFLICT_COMMENT" file.txt "feature6's side" 1
 
 # Wait for continuation workflow
 echo >&2 "Waiting for continuation workflow for feature6..."
@@ -1233,6 +1304,11 @@ else
     echo >&2 "❌ Verification Failed: PR #$PR6_NUM still has conflict label."
     exit 1
 fi
+assert_pr_changed_lines "$PR6_URL" "PR6 diff contains only its resolved conflict" "$(cat <<'EOF'
+-Main conflicting content line 5
++Feature 6 conflicting content line 5
+EOF
+)"
 
 # PR7 should still have conflict label and feature5 as base
 PR7_LABEL_STILL=$(gh pr view "$PR7_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
@@ -1246,8 +1322,7 @@ fi
 
 # 21. Resolve second sibling (feature7) - now feature5 should be deleted
 echo >&2 "21. Resolving second sibling (feature7) by following the posted comment..."
-follow_conflict_comment "$PR7_CONFLICT_COMMENT" feature7 file.txt "feature7's side"
-log_cmd git push origin feature7
+follow_conflict_comment "$PR7_CONFLICT_COMMENT" file.txt "feature7's side" 1
 
 # Wait for continuation workflow
 echo >&2 "Waiting for continuation workflow for feature7..."
@@ -1275,6 +1350,11 @@ else
     echo >&2 "❌ Verification Failed: PR #$PR7_NUM base is '$PR7_BASE_FINAL', expected 'main'."
     exit 1
 fi
+assert_pr_changed_lines "$PR7_URL" "PR7 diff contains only its resolved conflict" "$(cat <<'EOF'
+-Main conflicting content line 5
++Feature 7 conflicting content line 5
+EOF
+)"
 
 echo >&2 "--- Sibling Conflicts Scenario Test Completed Successfully ---"
 
@@ -1575,6 +1655,225 @@ else
 fi
 
 echo >&2 "--- No Children Scenario Test Completed Successfully ---"
+
+
+# --- SCENARIO 7: Conflict Matrix Edge Cases ---
+# ===================================================================================
+# Covers conflict paths not exercised by the main trunk-conflict scenario:
+#   - base branch conflicts
+#   - base and trunk branch both conflict in the first run
+#   - base branch conflicts, then the pushed fix exposes a trunk conflict
+# ===================================================================================
+
+echo >&2 "--- Testing Conflict Matrix Edge Cases ---"
+
+# 32. Base branch conflict only
+echo >&2 "32. Testing base-branch conflict..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+log_cmd git checkout -b feature15 main
+sed -i '8s/.*/Feature 15 content line 8/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 15"
+log_cmd git push origin feature15
+PR15_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature15 --title "Feature 15" --body "Base conflict parent")
+PR15_NUM=$(echo "$PR15_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout -b feature16 feature15
+sed -i '9s/.*/Feature 16 base conflict line 9/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 16"
+FEATURE16_BEFORE_CONFLICT=$(git rev-parse HEAD)
+log_cmd git push origin feature16
+PR16_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature15 --head feature16 --title "Feature 16" --body "Base conflict child")
+PR16_NUM=$(echo "$PR16_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout feature15
+sed -i '9s/.*/Feature 15 base conflict line 9/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Create base conflict for feature16"
+log_cmd git push origin feature15
+
+merge_pr_with_retry "$PR15_URL"
+MERGE_COMMIT_SHA15=$(gh pr view "$PR15_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+if ! wait_for_workflow "$PR15_NUM" "feature15" "$MERGE_COMMIT_SHA15" "success"; then
+    echo >&2 "Workflow for PR15 merge did not complete successfully."
+    exit 1
+fi
+
+log_cmd git fetch origin --prune
+if [[ "$(git rev-parse refs/remotes/origin/feature16)" == "$FEATURE16_BEFORE_CONFLICT" ]]; then
+    echo >&2 "✅ Verification Passed: base-conflicted feature16 was not pre-pushed."
+else
+    echo >&2 "❌ Verification Failed: feature16 advanced even though the base merge conflicted."
+    exit 1
+fi
+PR16_CONFLICT_COMMENT=$(get_conflict_comment "$PR16_URL" "$PR16_NUM" 1)
+assert_conflict_comment_merges "$PR16_CONFLICT_COMMENT" "origin/feature15"
+follow_conflict_comment "$PR16_CONFLICT_COMMENT" file.txt "feature16's side" 1
+if ! wait_for_synchronize_workflow "$PR16_NUM" "feature16" "success"; then
+    echo >&2 "Continuation workflow for feature16 did not complete successfully."
+    exit 1
+fi
+PR16_LABEL_AFTER=$(gh pr view "$PR16_URL" --repo "$REPO_FULL_NAME" --json labels --jq '.labels[] | select(.name == "autorestack-needs-conflict-resolution") | .name')
+PR16_BASE_AFTER=$(gh pr view "$PR16_NUM" --repo "$REPO_FULL_NAME" --json baseRefName --jq .baseRefName)
+if [[ -z "$PR16_LABEL_AFTER" && "$PR16_BASE_AFTER" == "main" ]]; then
+    echo >&2 "✅ Verification Passed: feature16 conflict label removed and base updated."
+else
+    echo >&2 "❌ Verification Failed: feature16 label='$PR16_LABEL_AFTER', base='$PR16_BASE_AFTER'."
+    exit 1
+fi
+assert_pr_changed_lines "$PR16_URL" "PR16 diff contains only its resolved base conflict" "$(cat <<'EOF'
+-Feature 15 base conflict line 9
++Feature 16 base conflict line 9
+EOF
+)"
+
+# 33. Base and trunk branch both conflict in the first run
+echo >&2 "33. Testing base-and-trunk conflict in one comment..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+log_cmd git checkout -b feature17 main
+sed -i '8s/.*/Feature 17 content line 8/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 17"
+log_cmd git push origin feature17
+PR17_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature17 --title "Feature 17" --body "Base and trunk conflict parent")
+PR17_NUM=$(echo "$PR17_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout -b feature18 feature17
+sed -i '9s/.*/Feature 18 base conflict line 9/' file.txt
+sed -i '13s/.*/Feature 18 trunk conflict line 13/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 18"
+FEATURE18_BEFORE_CONFLICT=$(git rev-parse HEAD)
+log_cmd git push origin feature18
+PR18_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature17 --head feature18 --title "Feature 18" --body "Base and trunk conflict child")
+PR18_NUM=$(echo "$PR18_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout feature17
+sed -i '9s/.*/Feature 17 base conflict line 9/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Create base conflict for feature18"
+log_cmd git push origin feature17
+
+log_cmd git checkout main
+sed -i '13s/.*/Main trunk conflict line 13/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Create trunk conflict for feature18"
+log_cmd git push origin main
+
+merge_pr_with_retry "$PR17_URL"
+MERGE_COMMIT_SHA17=$(gh pr view "$PR17_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+if ! wait_for_workflow "$PR17_NUM" "feature17" "$MERGE_COMMIT_SHA17" "success"; then
+    echo >&2 "Workflow for PR17 merge did not complete successfully."
+    exit 1
+fi
+
+log_cmd git fetch origin --prune
+if [[ "$(git rev-parse refs/remotes/origin/feature18)" == "$FEATURE18_BEFORE_CONFLICT" ]]; then
+    echo >&2 "✅ Verification Passed: base-and-trunk-conflicted feature18 was not pre-pushed."
+else
+    echo >&2 "❌ Verification Failed: feature18 advanced even though the base merge conflicted."
+    exit 1
+fi
+PR18_CONFLICT_COMMENT=$(get_conflict_comment "$PR18_URL" "$PR18_NUM" 1)
+PRE_SQUASH_COMMIT17=$(git rev-parse "$MERGE_COMMIT_SHA17~")
+assert_conflict_comment_merges "$PR18_CONFLICT_COMMENT" "origin/feature17" "$PRE_SQUASH_COMMIT17"
+follow_conflict_comment "$PR18_CONFLICT_COMMENT" file.txt "feature18's side" 2
+if ! wait_for_synchronize_workflow "$PR18_NUM" "feature18" "success"; then
+    echo >&2 "Continuation workflow for feature18 did not complete successfully."
+    exit 1
+fi
+assert_pr_changed_lines "$PR18_URL" "PR18 diff contains only its two resolved conflicts" "$(cat <<'EOF'
+-Feature 17 base conflict line 9
++Feature 18 base conflict line 9
+-Main trunk conflict line 13
++Feature 18 trunk conflict line 13
+EOF
+)"
+
+# 34. Base branch conflict, followed by trunk conflict after the user pushes a fix
+echo >&2 "34. Testing base conflict followed by trunk conflict on continuation..."
+log_cmd git checkout main
+log_cmd git pull origin main
+
+log_cmd git checkout -b feature19 main
+sed -i '8s/.*/Feature 19 content line 8/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 19"
+log_cmd git push origin feature19
+PR19_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature19 --title "Feature 19" --body "Follow-up trunk conflict parent")
+PR19_NUM=$(echo "$PR19_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout -b feature20 feature19
+sed -i '9s/.*/Feature 20 base conflict line 9/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Add feature 20"
+FEATURE20_BEFORE_CONFLICT=$(git rev-parse HEAD)
+log_cmd git push origin feature20
+PR20_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature19 --head feature20 --title "Feature 20" --body "Follow-up trunk conflict child")
+PR20_NUM=$(echo "$PR20_URL" | awk -F'/' '{print $NF}')
+
+log_cmd git checkout feature19
+sed -i '9s/.*/Feature 19 base conflict line 9/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Create base conflict for feature20"
+log_cmd git push origin feature19
+
+log_cmd git checkout main
+sed -i '13s/.*/Main follow-up trunk conflict line 13/' file.txt
+log_cmd git add file.txt
+log_cmd git commit -m "Create follow-up trunk conflict for feature20"
+log_cmd git push origin main
+
+merge_pr_with_retry "$PR19_URL"
+MERGE_COMMIT_SHA19=$(gh pr view "$PR19_URL" --repo "$REPO_FULL_NAME" --json mergeCommit -q .mergeCommit.oid)
+if ! wait_for_workflow "$PR19_NUM" "feature19" "$MERGE_COMMIT_SHA19" "success"; then
+    echo >&2 "Workflow for PR19 merge did not complete successfully."
+    exit 1
+fi
+
+log_cmd git fetch origin --prune
+if [[ "$(git rev-parse refs/remotes/origin/feature20)" == "$FEATURE20_BEFORE_CONFLICT" ]]; then
+    echo >&2 "✅ Verification Passed: base-conflicted feature20 was not pre-pushed."
+else
+    echo >&2 "❌ Verification Failed: feature20 advanced even though the base merge conflicted."
+    exit 1
+fi
+PR20_FIRST_CONFLICT_COMMENT=$(get_conflict_comment "$PR20_URL" "$PR20_NUM" 1)
+assert_conflict_comment_merges "$PR20_FIRST_CONFLICT_COMMENT" "origin/feature19"
+
+introduce_feature20_trunk_conflict_before_push() {
+    sed -i '13s/.*/Feature 20 follow-up trunk conflict line 13/' file.txt
+    log_cmd git add file.txt
+    log_cmd git commit -m "Introduce follow-up trunk conflict"
+}
+
+follow_conflict_comment "$PR20_FIRST_CONFLICT_COMMENT" file.txt "feature20's side" 1 introduce_feature20_trunk_conflict_before_push
+if ! wait_for_synchronize_workflow "$PR20_NUM" "feature20" "failure"; then
+    echo >&2 "Expected continuation workflow for feature20 to fail with a new trunk conflict."
+    exit 1
+fi
+PR20_SECOND_CONFLICT_COMMENT=$(get_conflict_comment "$PR20_URL" "$PR20_NUM" 2)
+PRE_SQUASH_COMMIT19=$(git rev-parse "$MERGE_COMMIT_SHA19~")
+assert_conflict_comment_merges "$PR20_SECOND_CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT19"
+follow_conflict_comment "$PR20_SECOND_CONFLICT_COMMENT" file.txt "feature20's side" 1
+if ! wait_for_synchronize_workflow "$PR20_NUM" "feature20" "success"; then
+    echo >&2 "Continuation workflow for feature20 did not complete successfully after trunk conflict resolution."
+    exit 1
+fi
+assert_pr_changed_lines "$PR20_URL" "PR20 diff contains only the base and follow-up trunk resolutions" "$(cat <<'EOF'
+-Feature 19 base conflict line 9
++Feature 20 base conflict line 9
+-Main follow-up trunk conflict line 13
++Feature 20 follow-up trunk conflict line 13
+EOF
+)"
+
+echo >&2 "--- Conflict Matrix Edge Cases Completed Successfully ---"
 
 
 # --- Test Succeeded ---

@@ -111,27 +111,32 @@ update_direct_target() {
             echo " into this branch while updating the pull request stack and hit conflicts."
             echo
             echo "#### How to resolve"
-            echo '```bash'
-            echo "git fetch origin"
-            echo "git switch $BRANCH"
-            # When the base merge was clean we already pushed it to this branch,
-            # so the local branch is now behind origin. Fast-forward to it before
-            # resolving, otherwise the final push is rejected as non-fast-forward.
-            # The line is a harmless no-op on the fallback path (nothing pushed).
-            echo -n "git pull --ff-only origin $BRANCH"
-            if [[ "$BASE_MERGE_CLEAN" == true ]]; then
-                echo "  # pick up the base merge this action already pushed"
-            else
+            for i in "${!CONFLICTS[@]}"; do
+                if [[ "$i" -eq 0 ]]; then
+                    echo '```bash'
+                    echo "git fetch origin"
+                    echo "git switch $BRANCH"
+                    # When the base merge was clean we already pushed it to this branch,
+                    # so the local branch is now behind origin. Fast-forward to it before
+                    # resolving, otherwise the final push is rejected as non-fast-forward.
+                    # The line is a harmless no-op on the fallback path (nothing pushed).
+                    echo -n "git pull --ff-only origin $BRANCH"
+                    if [[ "$BASE_MERGE_CLEAN" == true ]]; then
+                        echo "  # pick up the base merge this action already pushed"
+                    else
+                        echo
+                    fi
+                else
+                    echo '```bash'
+                fi
+                echo "git merge ${CONFLICTS[$i]}"
+                echo '```'
                 echo
-            fi
-            for conflict in "${CONFLICTS[@]}"; do
-                echo "git merge $conflict"
-                echo "# ..."
-                echo '# fix conflicts, for instance with `git mergetool`'
-                echo "# ..."
-                echo "git commit"
+                echo 'If this stops with conflicts, fix them (for instance with `git mergetool`), then run `git commit` before continuing.'
+                echo
             done
-            echo "git push"
+            echo '```bash'
+            echo "git push origin $BRANCH"
             echo '```'
             echo
             echo "Once you push, this action will resume and finish updating this pull request."
