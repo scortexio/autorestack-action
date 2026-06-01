@@ -114,12 +114,7 @@ update_direct_target() {
             echo '```bash'
             echo "git fetch origin"
             echo "git switch $BRANCH"
-            echo -n "git pull --ff-only origin $BRANCH"
-            if [[ "$BASE_MERGE_CLEAN" == true ]]; then
-                echo "  # pick up the base merge this action already pushed"
-            else
-                echo
-            fi
+            echo "git pull --ff-only origin $BRANCH"
             for conflict in "${CONFLICTS[@]}"; do
                 echo "git merge $conflict"
                 echo "# ..."
