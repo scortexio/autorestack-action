@@ -116,7 +116,7 @@ update_direct_target() {
                     echo '```bash'
                     echo "git fetch origin"
                     echo "git switch $BRANCH"
-                    echo "git pull --ff-only origin $BRANCH"
+                    echo "git pull origin $BRANCH"
                 else
                     echo '```bash'
                 fi
