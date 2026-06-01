@@ -115,14 +115,16 @@ update_direct_target() {
             echo "git fetch origin"
             echo "git switch $BRANCH"
             echo "git pull origin $BRANCH"
-            for conflict in "${CONFLICTS[@]}"; do
-                echo "git merge $conflict"
-                echo "# ..."
-                echo '# fix conflicts, for instance with `git mergetool`'
-                echo "# ..."
-                echo "git commit"
+
+            for i in "${!CONFLICTS[@]}"; do
+                echo "git merge ${CONFLICTS[$i]}"
+                echo '```'
+                echo
+                echo 'Fix the conflicts (for instance with `git mergetool`), then run `git commit` before continuing.'
+                echo
+                echo '```bash'
             done
-            echo "git push"
+            echo "git push origin $BRANCH"
             echo '```'
             echo
             echo "Once you push, this action will resume and finish updating this pull request."
