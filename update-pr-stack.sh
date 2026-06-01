@@ -111,20 +111,19 @@ update_direct_target() {
             echo " into this branch while updating the pull request stack and hit conflicts."
             echo
             echo "#### How to resolve"
+            echo '```bash'
+            echo "git fetch origin"
+            echo "git switch $BRANCH"
+            echo "git pull origin $BRANCH"
+
             for i in "${!CONFLICTS[@]}"; do
-                echo '```bash'
-                if [[ "$i" -eq 0 ]]; then
-                    echo "git fetch origin"
-                    echo "git switch $BRANCH"
-                    echo "git pull origin $BRANCH"
-                fi
                 echo "git merge ${CONFLICTS[$i]}"
                 echo '```'
                 echo
                 echo 'Fix the conflicts (for instance with `git mergetool`), then run `git commit` before continuing.'
                 echo
+                echo '```bash'
             done
-            echo '```bash'
             echo "git push origin $BRANCH"
             echo '```'
             echo
