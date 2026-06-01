@@ -98,6 +98,8 @@ update_direct_target() {
         # pull_request workflows on a PR conflicting with its base, which would
         # otherwise strand the branch for good. If the base merge itself
         # conflicted we have nothing safe to pre-push, so we just ask for help.
+        # Note: ordering is important here: if we label before pushing, we
+        # re-trigger ourselves immediately.
         if [[ "$BASE_MERGE_CLEAN" == true ]]; then
             log_cmd git push origin "$BRANCH"
         fi
@@ -116,10 +118,11 @@ update_direct_target() {
             # so the local branch is now behind origin. Fast-forward to it before
             # resolving, otherwise the final push is rejected as non-fast-forward.
             # The line is a harmless no-op on the fallback path (nothing pushed).
+            echo -n "git pull --ff-only origin $BRANCH"
             if [[ "$BASE_MERGE_CLEAN" == true ]]; then
-                echo "git pull --ff-only origin $BRANCH  # pick up the base merge this action already pushed"
+                echo "  # pick up the base merge this action already pushed"
             else
-                echo "git pull --ff-only origin $BRANCH"
+                echo
             fi
             for conflict in "${CONFLICTS[@]}"; do
                 echo "git merge $conflict"
@@ -205,8 +208,8 @@ continue_after_resolution() {
     # and the merged PR whose head is OLD_BASE gives the new target (its base) and
     # the squash commit (its merge commit).
     local NEW_TARGET SQUASH_HASH
-    NEW_TARGET=$(gh pr list --head "$OLD_BASE" --state merged --json baseRefName --jq '.[0].baseRefName')
-    SQUASH_HASH=$(gh pr list --head "$OLD_BASE" --state merged --json mergeCommit --jq '.[0].mergeCommit.oid')
+    read -r NEW_TARGET SQUASH_HASH < <(gh pr list --head "$OLD_BASE" --state merged \
+        --json baseRefName,mergeCommit --jq '.[0] | "\(.baseRefName // "") \(.mergeCommit.oid // "")"')
 
     if [[ -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
         echo "⚠️ Could not find where '$OLD_BASE' was merged to; skipping base branch and deletion updates"
@@ -224,7 +227,7 @@ continue_after_resolution() {
         MERGED_BRANCH="$OLD_BASE"
         TARGET_BRANCH="$NEW_TARGET"
         if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
-            echo "⚠️ Unexpected conflict while recording the squash on '$PR_BRANCH'; leaving it for manual handling"
+            echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
             return 1
         fi
         log_cmd git push origin "$PR_BRANCH"
