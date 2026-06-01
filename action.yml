@@ -52,6 +52,7 @@ runs:
         ACTION_MODE: ${{ steps.check.outputs.mode }}
         SQUASH_COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
         MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
+        MERGED_PR_NUMBER: ${{ github.event.pull_request.number }}
         TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
         PR_BRANCH: ${{ github.event.pull_request.head.ref }}
       run: |

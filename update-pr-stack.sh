@@ -45,22 +45,18 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
-# Render a conflict ref for prose. When the ref is a branch that has a pull
-# request, emit a "#N" reference that GitHub turns into a link; otherwise emit
-# the ref in backticks (the pre-squash trunk state is a bare commit with no PR).
-# The bash recipe still uses the raw ref, which `git merge` needs.
+# Render a conflict ref for the prose. The merged parent branch is shown as a
+# "#N" reference that GitHub links to its PR (MERGED_PR_NUMBER comes straight
+# from the event payload); the pre-squash trunk state is a bare commit with no
+# PR, so it stays in backticks. The bash recipe still uses the raw ref, which
+# `git merge` needs.
 format_conflict_ref_for_text() {
     local ref="$1"
-    local branch="${ref#origin/}"
-    if [[ "$branch" != "$ref" ]]; then
-        local number
-        number=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // ""' 2>/dev/null || true)
-        if [[ -n "$number" ]]; then
-            printf '#%s' "$number"
-            return
-        fi
+    if [[ "$ref" == "origin/$MERGED_BRANCH" && -n "${MERGED_PR_NUMBER:-}" ]]; then
+        printf '#%s' "$MERGED_PR_NUMBER"
+    else
+        printf '`%s`' "$ref"
     fi
-    printf '`%s`' "$ref"
 }
 
 format_conflict_list_for_text() {
@@ -215,13 +211,13 @@ continue_after_resolution() {
     echo "Current base branch: $OLD_BASE"
 
     # The synchronize payload is the child PR, so SQUASH_COMMIT / MERGED_BRANCH /
-    # TARGET_BRANCH from the original squash-merge run are not in the environment.
-    # Reconstruct them from the merged parent PR: OLD_BASE is the parent branch,
-    # and the merged PR whose head is OLD_BASE gives the new target (its base) and
-    # the squash commit (its merge commit).
-    local NEW_TARGET SQUASH_HASH
-    read -r NEW_TARGET SQUASH_HASH < <(gh pr list --head "$OLD_BASE" --state merged \
-        --json baseRefName,mergeCommit --jq '.[0] | "\(.baseRefName // "") \(.mergeCommit.oid // "")"')
+    # TARGET_BRANCH / MERGED_PR_NUMBER from the original squash-merge run are not
+    # in the environment. Reconstruct them from the merged parent PR: OLD_BASE is
+    # the parent branch, and the merged PR whose head is OLD_BASE gives the new
+    # target (its base), the squash commit (its merge commit), and its number.
+    local NEW_TARGET SQUASH_HASH MERGED_PR_NUMBER
+    read -r NEW_TARGET SQUASH_HASH MERGED_PR_NUMBER < <(gh pr list --head "$OLD_BASE" --state merged \
+        --json baseRefName,mergeCommit,number --jq '.[0] | "\(.baseRefName // "") \(.mergeCommit.oid // "") \(.number // "")"')
 
     if [[ -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
         echo "⚠️ Could not find where '$OLD_BASE' was merged to; skipping base branch and deletion updates"
