@@ -45,14 +45,33 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
-format_branch_list_for_text() {
+# Render a conflict ref for prose. When the ref is a branch that has a pull
+# request, emit a "#N" reference that GitHub turns into a link; otherwise emit
+# the ref in backticks (the pre-squash trunk state is a bare commit with no PR).
+# The bash recipe still uses the raw ref, which `git merge` needs.
+format_conflict_ref_for_text() {
+    local ref="$1"
+    local branch="${ref#origin/}"
+    if [[ "$branch" != "$ref" ]]; then
+        local number
+        number=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // ""' 2>/dev/null || true)
+        if [[ -n "$number" ]]; then
+            printf '#%s' "$number"
+            return
+        fi
+    fi
+    printf '`%s`' "$ref"
+}
+
+format_conflict_list_for_text() {
+    local separator
     for ((i=1; i<=$#; i++)); do
         case $i in
-            1) format='`%s`';;
-            $#) format=', and `%s`';;
-            *) format=', `%s`';;
+            1) separator='';;
+            $#) separator=', and ';;
+            *) separator=', ';;
         esac
-        printf "$format" "${!i}"
+        printf '%s%s' "$separator" "$(format_conflict_ref_for_text "${!i}")"
     done
 }
 
@@ -107,7 +126,7 @@ update_direct_target() {
             echo "### ⚠️ Automatic update blocked by merge conflicts"
             echo
             echo -n "I tried to merge "
-            format_branch_list_for_text "${CONFLICTS[@]}"
+            format_conflict_list_for_text "${CONFLICTS[@]}"
             echo " into this branch while updating the pull request stack and hit conflicts."
             echo
             echo "#### How to resolve"
