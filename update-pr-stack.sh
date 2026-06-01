@@ -112,13 +112,11 @@ update_direct_target() {
             echo
             echo "#### How to resolve"
             for i in "${!CONFLICTS[@]}"; do
+                echo '```bash'
                 if [[ "$i" -eq 0 ]]; then
-                    echo '```bash'
                     echo "git fetch origin"
                     echo "git switch $BRANCH"
                     echo "git pull origin $BRANCH"
-                else
-                    echo '```bash'
                 fi
                 echo "git merge ${CONFLICTS[$i]}"
                 echo '```'
