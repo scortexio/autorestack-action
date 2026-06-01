@@ -121,7 +121,7 @@ update_direct_target() {
                 echo "git merge ${CONFLICTS[$i]}"
                 echo '```'
                 echo
-                echo 'If this stops with conflicts, fix them (for instance with `git mergetool`), then run `git commit` before continuing.'
+                echo 'Fix the conflicts (for instance with `git mergetool`), then run `git commit` before continuing.'
                 echo
             done
             echo '```bash'
