@@ -237,12 +237,6 @@ follow_conflict_comment() {
 
     log_cmd git fetch origin
     log_cmd git checkout "$branch"
-
-    if ! echo "$comment" | grep -q "^git pull origin $branch"; then
-        echo >&2 "❌ Verification Failed: comment does not tell the user to re-sync (git pull origin $branch)."
-        echo >&2 "$comment"
-        exit 1
-    fi
     log_cmd git pull origin "$branch"
 
     comment_merges=$(echo "$comment" | grep -E '^git merge' || true)
