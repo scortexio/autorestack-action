@@ -1,5 +1,5 @@
 name: Update PR Stack
-run-name: ${{ github.event.action }} PR #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}
+run-name: "${{ github.event.action }} PR #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}"
 
 on:
   pull_request:

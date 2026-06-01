@@ -62,9 +62,14 @@ install_gh_cli() {
 acquire_token() {
     log_info "Acquiring GitHub App token..."
 
-    # Check if required environment variables are set
-    if [[ -z "$GH_APP_ID" ]] || [[ -z "$GH_APP_PRIVATE_KEY" ]]; then
-        log_error "Missing required environment variables: GH_APP_ID and/or GH_APP_PRIVATE_KEY"
+    # Check if required configuration is present. The token generator reads the
+    # private key from the repo-local .gh-app-private-key.pem file.
+    if [[ -z "$GH_APP_ID" ]]; then
+        log_error "Missing required environment variable: GH_APP_ID"
+        return 1
+    fi
+    if [[ ! -f "$PROJECT_ROOT/.gh-app-private-key.pem" ]]; then
+        log_error "Missing required private key file: $PROJECT_ROOT/.gh-app-private-key.pem"
         return 1
     fi
 
