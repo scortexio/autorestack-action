@@ -98,6 +98,20 @@
 #   - Deletes feature2 branch (no other conflicted PRs depend on it)
 #   - NOTE: feature4 is NOT updated (indirect children are not modified)
 #
+# SCENARIO 3: Sibling Conflicts (Steps 16-22)
+# -------------------------------------------
+# Tests that the old base branch is kept until ALL sibling PRs (multiple PRs
+# from the same base) have resolved their conflicts.
+#
+# Setup:
+#   - Create main <- feature5 <- (feature6, feature7) parallel children
+#   - feature6 and feature7 both modify line 5; main modifies line 5 differently
+#
+# Expected Behavior:
+#   - After merging feature5, both feature6 and feature7 conflict
+#   - feature5 is kept while either sibling is still conflicted
+#   - feature5 is deleted only after both siblings have resolved
+#
 # SCENARIO 4: Multi-child with 0 conflicts (Steps 23-25)
 # -------------------------------------------------------
 # Tests that when a PR with 2 children is merged and neither conflicts,
@@ -213,6 +227,29 @@ compare_diffs() {
     fi
 }
 
+# Apply one or more "<line> <content>" edits to file.txt and commit them.
+edit_and_commit() {
+    local message=$1
+    shift
+    while [[ $# -ge 2 ]]; do
+        sed -i "${1}s/.*/${2}/" file.txt
+        shift 2
+    done
+    log_cmd git add file.txt
+    log_cmd git commit -m "$message"
+}
+
+# Push <branch> and open a PR for it. The last two arguments name the caller
+# variables that receive the PR URL and number.
+create_pr() {
+    local branch=$1 base=$2 title=$3 body=$4
+    local -n _url=$5 _num=$6
+    log_cmd git push origin "$branch"
+    _url=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base "$base" --head "$branch" --title "$title" --body "$body")
+    _num=${_url##*/}
+    echo >&2 "Created PR #$_num: $_url"
+}
+
 get_conflict_comment() {
     local pr_url=$1
     local pr_number=$2
@@ -273,7 +310,7 @@ assert_conflict_comment_merges() {
 follow_conflict_comment() {
     local comment=$1
     local conflict_file=$2
-    local resolution_description=$3
+    local resolution_label=$3
     local expected_conflicts=$4
     local before_push_hook=${5:-}
     local in_block=false
@@ -314,8 +351,22 @@ follow_conflict_comment() {
         fi
         if ! log_cmd bash -e -c "$block"; then
             if git diff --name-only --diff-filter=U | grep -qx "$conflict_file"; then
-                echo >&2 "Conflict during comment block; resolving by keeping $resolution_description..."
-                log_cmd git checkout --ours "$conflict_file"
+                # Resolve like a human editing the file: replace each conflicted
+                # region with one sentinel line and keep every other line,
+                # including changes the merge brought in cleanly from the other
+                # side. `git checkout --ours` would instead take our whole copy of
+                # the file and silently drop those clean incoming changes.
+                local sentinel="Conflict resolved on $resolution_label"
+                echo >&2 "Conflict during comment block; resolving to '$sentinel'..."
+                local resolved
+                resolved=$(mktemp)
+                awk -v repl="$sentinel" '
+                    /^<<<<<<</ { print repl; skip=1; next }
+                    /^>>>>>>>/ { skip=0; next }
+                    skip { next }
+                    { print }
+                ' "$conflict_file" > "$resolved"
+                mv "$resolved" "$conflict_file"
                 log_cmd git add "$conflict_file"
                 log_cmd git commit --no-edit
                 hit_conflicts=$((hit_conflicts + 1))
@@ -473,8 +524,10 @@ wait_for_synchronize_workflow() {
                 echo >&2 "  Run display title: $run_display_title"
                 echo >&2 "  Run head branch: $run_head_branch"
 
-                if [[ "$run_display_title" == "$expected_run_name"* && "$run_head_branch" == "$branch_name" ]]; then
-                    echo >&2 "Found matching workflow run ID: $run_id (run name and branch match)"
+                # The run-name is "<action> PR #<n> - <title>"; matching the
+                # prefix including " - " keeps "#2" from matching "#20".
+                if [[ "$run_display_title" == "$expected_run_name - "* ]]; then
+                    echo >&2 "Found matching workflow run ID: $run_id (run name matches)"
                     target_run_id="$run_id"
                     break
                 fi
@@ -575,10 +628,10 @@ wait_for_workflow() {
                 echo >&2 "  Run head branch: $run_head_branch, head SHA: $run_head_sha"
                 echo >&2 "  Expected merged branch: $merged_branch_name, merge commit SHA: $merge_commit_sha"
 
-                # For pull_request events, the workflow runs on the PR's head branch
-                # Match by the run name event action and the head branch.
-                if [[ "$run_display_title" == "$expected_run_name"* && "$run_head_branch" == "$merged_branch_name" ]]; then
-                    echo >&2 "Found matching workflow run ID: $run_id (run name and headBranch match)"
+                # The run-name is "<action> PR #<n> - <title>"; matching the
+                # prefix including " - " keeps "#2" from matching "#20".
+                if [[ "$run_display_title" == "$expected_run_name - "* ]]; then
+                    echo >&2 "Found matching workflow run ID: $run_id (run name matches)"
                     target_run_id="$run_id"
                     break # Found the run, exit the inner loop
                 else
@@ -738,22 +791,13 @@ log_cmd gh api -X PATCH "/repos/$REPO_FULL_NAME" --input - <<< '{"delete_branch_
 echo >&2 "0b. Creating 'no action' stack..."
 log_cmd git checkout main
 log_cmd git checkout -b noact_feature1 main
-sed -i '3s/.*/NoAct Feature 1 line 3/' file.txt  # Feature 1 changes LINE 3
-log_cmd git add file.txt
-log_cmd git commit -m "NoAct: Add feature 1"
-log_cmd git push origin noact_feature1
-NOACT_PR1_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head noact_feature1 --title "NoAct Feature 1" --body "NoAct PR 1")
-NOACT_PR1_NUM=$(echo "$NOACT_PR1_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created NoAct PR #$NOACT_PR1_NUM: $NOACT_PR1_URL"
+# Each feature changes a DIFFERENT line so pollution is clearly visible
+edit_and_commit "NoAct: Add feature 1" 3 "NoAct Feature 1 line 3"
+create_pr noact_feature1 main "NoAct Feature 1" "NoAct PR 1" NOACT_PR1_URL NOACT_PR1_NUM
 
 log_cmd git checkout -b noact_feature2 noact_feature1
-sed -i '4s/.*/NoAct Feature 2 line 4/' file.txt  # Feature 2 changes LINE 4 (different!)
-log_cmd git add file.txt
-log_cmd git commit -m "NoAct: Add feature 2"
-log_cmd git push origin noact_feature2
-NOACT_PR2_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base noact_feature1 --head noact_feature2 --title "NoAct Feature 2" --body "NoAct PR 2, based on NoAct PR 1")
-NOACT_PR2_NUM=$(echo "$NOACT_PR2_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created NoAct PR #$NOACT_PR2_NUM: $NOACT_PR2_URL"
+edit_and_commit "NoAct: Add feature 2" 4 "NoAct Feature 2 line 4"
+create_pr noact_feature2 noact_feature1 "NoAct Feature 2" "NoAct PR 2, based on NoAct PR 1" NOACT_PR2_URL NOACT_PR2_NUM
 
 # Capture initial diff (should show only 1 line change)
 echo >&2 "0c. Capturing initial diff for PR2..."
@@ -825,44 +869,21 @@ echo >&2 "4. Creating stacked branches and PRs..."
 # - A unique line (for diff pollution visibility)
 # Branch feature1 (base: main)
 log_cmd git checkout -b feature1 main
-sed -i '2s/.*/Feature 1 content line 2/' file.txt # Edit line 2
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 1"
-log_cmd git push origin feature1
-PR1_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature1 --title "Feature 1" --body "This is PR 1")
-PR1_NUM=$(echo "$PR1_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR1_NUM: $PR1_URL"
+edit_and_commit "Add feature 1" 2 "Feature 1 content line 2"
+create_pr feature1 main "Feature 1" "This is PR 1" PR1_URL PR1_NUM
 # Branch feature2 (base: feature1)
 log_cmd git checkout -b feature2 feature1
-sed -i '2s/.*/Feature 2 content line 2/' file.txt # Edit line 2 (shared)
-sed -i '3s/.*/Feature 2 content line 3/' file.txt # Edit line 3 (unique)
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 2"
-log_cmd git push origin feature2
-PR2_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature1 --head feature2 --title "Feature 2" --body "This is PR 2, based on PR 1")
-PR2_NUM=$(echo "$PR2_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR2_NUM: $PR2_URL"
+edit_and_commit "Add feature 2" 2 "Feature 2 content line 2" 3 "Feature 2 content line 3"
+create_pr feature2 feature1 "Feature 2" "This is PR 2, based on PR 1" PR2_URL PR2_NUM
 # Branch feature3 (base: feature2)
 log_cmd git checkout -b feature3 feature2
-sed -i '2s/.*/Feature 3 content line 2/' file.txt # Edit line 2 (shared)
-sed -i '4s/.*/Feature 3 content line 4/' file.txt # Edit line 4 (unique)
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 3"
-log_cmd git push origin feature3
-PR3_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature2 --head feature3 --title "Feature 3" --body "This is PR 3, based on PR 2")
-PR3_NUM=$(echo "$PR3_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR3_NUM: $PR3_URL"
+edit_and_commit "Add feature 3" 2 "Feature 3 content line 2" 4 "Feature 3 content line 4"
+create_pr feature3 feature2 "Feature 3" "This is PR 3, based on PR 2" PR3_URL PR3_NUM
 
 # Branch feature4 (base: feature3) - tests that indirect children's diffs remain correct
 log_cmd git checkout -b feature4 feature3
-sed -i '2s/.*/Feature 4 content line 2/' file.txt # Edit line 2 (shared)
-sed -i '5s/.*/Feature 4 content line 5/' file.txt # Edit line 5 (unique)
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 4"
-log_cmd git push origin feature4
-PR4_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature3 --head feature4 --title "Feature 4" --body "This is PR 4, based on PR 3 (indirect child, tests diff preservation)")
-PR4_NUM=$(echo "$PR4_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR4_NUM: $PR4_URL"
+edit_and_commit "Add feature 4" 2 "Feature 4 content line 2" 5 "Feature 4 content line 5"
+create_pr feature4 feature3 "Feature 4" "This is PR 4, based on PR 3 (indirect child, tests diff preservation)" PR4_URL PR4_NUM
 
 # Capture initial diffs for diff validation
 echo >&2 "Capturing initial diffs for diff validation..."
@@ -957,17 +978,13 @@ echo >&2 "--- Testing Conflict Scenario (Merging PR2) ---"
 echo >&2 "8. Introducing conflicting changes..."
 # Change line 7 on feature3 (far from line 2 to avoid adjacent-line conflicts)
 log_cmd git checkout feature3
-sed -i '7s/.*/Feature 3 conflicting change line 7/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Conflict: Modify line 7 on feature3"
+edit_and_commit "Conflict: Modify line 7 on feature3" 7 "Feature 3 conflicting change line 7"
 FEATURE3_CONFLICT_COMMIT_SHA=$(git rev-parse HEAD) # Store this SHA
 log_cmd git push origin feature3
 # Change line 7 on main differently - this will conflict when rebasing feature3 after PR2 merge
 log_cmd git checkout main
 log_cmd git pull origin main  # Pull latest changes from PR1 merge
-sed -i '7s/.*/Main conflicting change line 7/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Conflict: Modify line 7 on main"
+edit_and_commit "Conflict: Modify line 7 on main" 7 "Main conflicting change line 7"
 log_cmd git push origin main
 
 # 9. Trigger Action by Squash Merging PR2 (which is now based on the updated main from step 7)
@@ -1074,7 +1091,7 @@ echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
 # then run it. Following the comment must leave feature3 cleanly mergeable into
 # its new base, or the synchronize-triggered continuation can never make progress
 # and the conflict label stays stuck.
-follow_conflict_comment "$CONFLICT_COMMENT" file.txt "feature3's side" 1
+follow_conflict_comment "$CONFLICT_COMMENT" file.txt "feature3" 1
 echo >&2 "Resolved file.txt content:"
 cat file.txt
 echo >&2 "Pushed resolved feature3."
@@ -1145,11 +1162,11 @@ echo >&2 "✅ feature4 intentionally not updated (indirect child of resolved PR)
 # Verify the final content of file.txt on feature3
 # Line 1: Original base
 # Line 2: From feature 3 commit ("Feature 3 content line 2")
-# Line 7: From feature 3 conflict commit, kept during resolution ("Feature 3 conflicting change line 7")
+# Line 7: The conflicting line, rewritten to the resolution sentinel
 log_cmd git checkout feature3
 EXPECTED_CONTENT_LINE1="Base file content line 1"
 EXPECTED_CONTENT_LINE2="Feature 3 content line 2"
-EXPECTED_CONTENT_LINE7="Feature 3 conflicting change line 7"
+EXPECTED_CONTENT_LINE7="Conflict resolved on feature3"
 
 ACTUAL_CONTENT_LINE1=$(sed -n '1p' file.txt)
 ACTUAL_CONTENT_LINE2=$(sed -n '2p' file.txt)
@@ -1198,41 +1215,24 @@ log_cmd git pull origin main
 
 # Create feature5 based on main (modifies line 2, no conflict with line 5)
 log_cmd git checkout -b feature5 main
-sed -i '2s/.*/Feature 5 content line 2/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 5"
-log_cmd git push origin feature5
-PR5_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature5 --title "Feature 5" --body "This is PR 5")
-PR5_NUM=$(echo "$PR5_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR5_NUM: $PR5_URL"
+edit_and_commit "Add feature 5" 2 "Feature 5 content line 2"
+create_pr feature5 main "Feature 5" "This is PR 5" PR5_URL PR5_NUM
 
 # Create feature6 based on feature5 (modifies line 5, will conflict with main)
 log_cmd git checkout -b feature6 feature5
-sed -i '5s/.*/Feature 6 conflicting content line 5/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 6 (modifies line 5)"
-log_cmd git push origin feature6
-PR6_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature5 --head feature6 --title "Feature 6" --body "This is PR 6, sibling of PR 7")
-PR6_NUM=$(echo "$PR6_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR6_NUM: $PR6_URL"
+edit_and_commit "Add feature 6 (modifies line 5)" 5 "Feature 6 conflicting content line 5"
+create_pr feature6 feature5 "Feature 6" "This is PR 6, sibling of PR 7" PR6_URL PR6_NUM
 
 # Create feature7 based on feature5 (also modifies line 5, will conflict with main)
 log_cmd git checkout feature5
 log_cmd git checkout -b feature7
-sed -i '5s/.*/Feature 7 conflicting content line 5/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 7 (also modifies line 5)"
-log_cmd git push origin feature7
-PR7_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature5 --head feature7 --title "Feature 7" --body "This is PR 7, sibling of PR 6")
-PR7_NUM=$(echo "$PR7_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR7_NUM: $PR7_URL"
+edit_and_commit "Add feature 7 (also modifies line 5)" 5 "Feature 7 conflicting content line 5"
+create_pr feature7 feature5 "Feature 7" "This is PR 7, sibling of PR 6" PR7_URL PR7_NUM
 
 # Introduce conflicting change on main (line 5) - this will conflict with feature6/7
 # when the action tries to merge SQUASH_COMMIT~ into them
 log_cmd git checkout main
-sed -i '5s/.*/Main conflicting content line 5/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add conflicting change on main line 5"
+edit_and_commit "Add conflicting change on main line 5" 5 "Main conflicting content line 5"
 log_cmd git push origin main
 
 # 17. Merge feature5 to trigger conflicts on both siblings
@@ -1300,7 +1300,7 @@ assert_conflict_comment_merges "$PR7_CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT5"
 
 # 19. Resolve first sibling (feature6) - feature5 should still be kept
 echo >&2 "19. Resolving first sibling (feature6) by following the posted comment..."
-follow_conflict_comment "$PR6_CONFLICT_COMMENT" file.txt "feature6's side" 1
+follow_conflict_comment "$PR6_CONFLICT_COMMENT" file.txt "feature6" 1
 
 # Wait for continuation workflow
 echo >&2 "Waiting for continuation workflow for feature6..."
@@ -1340,7 +1340,7 @@ else
 fi
 assert_pr_changed_lines "$PR6_URL" "PR6 diff contains only its resolved conflict" "$(cat <<'EOF'
 -Main conflicting content line 5
-+Feature 6 conflicting content line 5
++Conflict resolved on feature6
 EOF
 )"
 
@@ -1356,7 +1356,7 @@ fi
 
 # 21. Resolve second sibling (feature7) - now feature5 should be deleted
 echo >&2 "21. Resolving second sibling (feature7) by following the posted comment..."
-follow_conflict_comment "$PR7_CONFLICT_COMMENT" file.txt "feature7's side" 1
+follow_conflict_comment "$PR7_CONFLICT_COMMENT" file.txt "feature7" 1
 
 # Wait for continuation workflow
 echo >&2 "Waiting for continuation workflow for feature7..."
@@ -1386,7 +1386,7 @@ else
 fi
 assert_pr_changed_lines "$PR7_URL" "PR7 diff contains only its resolved conflict" "$(cat <<'EOF'
 -Main conflicting content line 5
-+Feature 7 conflicting content line 5
++Conflict resolved on feature7
 EOF
 )"
 
@@ -1416,23 +1416,13 @@ log_cmd git pull origin main
 
 # Create feature8 based on main
 log_cmd git checkout -b feature8 main
-sed -i '2s/.*/Feature 8 content line 2/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 8"
-log_cmd git push origin feature8
-PR8_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature8 --title "Feature 8" --body "This is PR 8")
-PR8_NUM=$(echo "$PR8_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR8_NUM: $PR8_URL"
+edit_and_commit "Add feature 8" 2 "Feature 8 content line 2"
+create_pr feature8 main "Feature 8" "This is PR 8" PR8_URL PR8_NUM
 
 # Create feature9 based on feature8 (modifies line 3 — no conflict)
 log_cmd git checkout -b feature9 feature8
-sed -i '3s/.*/Feature 9 content line 3/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 9 (modifies line 3)"
-log_cmd git push origin feature9
-PR9_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature8 --head feature9 --title "Feature 9" --body "This is PR 9, child of PR 8")
-PR9_NUM=$(echo "$PR9_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR9_NUM: $PR9_URL"
+edit_and_commit "Add feature 9 (modifies line 3)" 3 "Feature 9 content line 3"
+create_pr feature9 feature8 "Feature 9" "This is PR 9, child of PR 8" PR9_URL PR9_NUM
 
 # Capture PR9 diff before merge
 PR9_DIFF_BEFORE=$(get_pr_diff "$PR9_URL")
@@ -1440,13 +1430,8 @@ PR9_DIFF_BEFORE=$(get_pr_diff "$PR9_URL")
 # Create feature10 based on feature8 (modifies line 4 — no conflict)
 log_cmd git checkout feature8
 log_cmd git checkout -b feature10
-sed -i '4s/.*/Feature 10 content line 4/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 10 (modifies line 4)"
-log_cmd git push origin feature10
-PR10_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature8 --head feature10 --title "Feature 10" --body "This is PR 10, child of PR 8")
-PR10_NUM=$(echo "$PR10_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR10_NUM: $PR10_URL"
+edit_and_commit "Add feature 10 (modifies line 4)" 4 "Feature 10 content line 4"
+create_pr feature10 feature8 "Feature 10" "This is PR 10, child of PR 8" PR10_URL PR10_NUM
 
 # Capture PR10 diff before merge
 PR10_DIFF_BEFORE=$(get_pr_diff "$PR10_URL")
@@ -1531,43 +1516,26 @@ log_cmd git pull origin main
 
 # Create feature11 based on main
 log_cmd git checkout -b feature11 main
-sed -i '2s/.*/Feature 11 content line 2/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 11"
-log_cmd git push origin feature11
-PR11_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature11 --title "Feature 11" --body "This is PR 11")
-PR11_NUM=$(echo "$PR11_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR11_NUM: $PR11_URL"
+edit_and_commit "Add feature 11" 2 "Feature 11 content line 2"
+create_pr feature11 main "Feature 11" "This is PR 11" PR11_URL PR11_NUM
 
 # Create feature12 based on feature11 (modifies line 5 — will conflict)
 log_cmd git checkout -b feature12 feature11
-sed -i '5s/.*/Feature 12 conflicting content line 5/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 12 (modifies line 5)"
-log_cmd git push origin feature12
-PR12_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature11 --head feature12 --title "Feature 12" --body "This is PR 12, child of PR 11")
-PR12_NUM=$(echo "$PR12_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR12_NUM: $PR12_URL"
+edit_and_commit "Add feature 12 (modifies line 5)" 5 "Feature 12 conflicting content line 5"
+create_pr feature12 feature11 "Feature 12" "This is PR 12, child of PR 11" PR12_URL PR12_NUM
 
 # Create feature13 based on feature11 (modifies line 6 — no conflict)
 log_cmd git checkout feature11
 log_cmd git checkout -b feature13
-sed -i '14s/.*/Feature 13 content line 14/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 13 (modifies line 14)"
-log_cmd git push origin feature13
-PR13_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature11 --head feature13 --title "Feature 13" --body "This is PR 13, child of PR 11")
-PR13_NUM=$(echo "$PR13_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR13_NUM: $PR13_URL"
+edit_and_commit "Add feature 13 (modifies line 14)" 14 "Feature 13 content line 14"
+create_pr feature13 feature11 "Feature 13" "This is PR 13, child of PR 11" PR13_URL PR13_NUM
 
 # Capture PR13 diff before merge
 PR13_DIFF_BEFORE=$(get_pr_diff "$PR13_URL")
 
 # Push conflicting change to main (line 5)
 log_cmd git checkout main
-sed -i '5s/.*/Main conflicting content line 5 for scenario 5/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add conflicting change on main line 5 (scenario 5)"
+edit_and_commit "Add conflicting change on main line 5 (scenario 5)" 5 "Main conflicting content line 5 for scenario 5"
 log_cmd git push origin main
 
 # 27. Merge feature11 to trigger mixed outcome
@@ -1657,13 +1625,8 @@ log_cmd git checkout main
 log_cmd git pull origin main
 
 log_cmd git checkout -b feature14 main
-sed -i '2s/.*/Feature 14 content line 2/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 14"
-log_cmd git push origin feature14
-PR14_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature14 --title "Feature 14" --body "This is PR 14, no children")
-PR14_NUM=$(echo "$PR14_URL" | awk -F'/' '{print $NF}')
-echo >&2 "Created PR #$PR14_NUM: $PR14_URL"
+edit_and_commit "Add feature 14" 2 "Feature 14 content line 2"
+create_pr feature14 main "Feature 14" "This is PR 14, no children" PR14_URL PR14_NUM
 
 # 30. Merge feature14
 echo >&2 "30. Squash merging PR #$PR14_NUM (feature14, no children)..."
@@ -1707,26 +1670,16 @@ log_cmd git checkout main
 log_cmd git pull origin main
 
 log_cmd git checkout -b feature15 main
-sed -i '8s/.*/Feature 15 content line 8/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 15"
-log_cmd git push origin feature15
-PR15_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature15 --title "Feature 15" --body "Base conflict parent")
-PR15_NUM=$(echo "$PR15_URL" | awk -F'/' '{print $NF}')
+edit_and_commit "Add feature 15" 8 "Feature 15 content line 8"
+create_pr feature15 main "Feature 15" "Base conflict parent" PR15_URL PR15_NUM
 
 log_cmd git checkout -b feature16 feature15
-sed -i '9s/.*/Feature 16 base conflict line 9/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 16"
+edit_and_commit "Add feature 16" 9 "Feature 16 base conflict line 9"
 FEATURE16_BEFORE_CONFLICT=$(git rev-parse HEAD)
-log_cmd git push origin feature16
-PR16_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature15 --head feature16 --title "Feature 16" --body "Base conflict child")
-PR16_NUM=$(echo "$PR16_URL" | awk -F'/' '{print $NF}')
+create_pr feature16 feature15 "Feature 16" "Base conflict child" PR16_URL PR16_NUM
 
 log_cmd git checkout feature15
-sed -i '9s/.*/Feature 15 base conflict line 9/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Create base conflict for feature16"
+edit_and_commit "Create base conflict for feature16" 9 "Feature 15 base conflict line 9"
 log_cmd git push origin feature15
 
 merge_pr_with_retry "$PR15_URL"
@@ -1745,7 +1698,7 @@ else
 fi
 PR16_CONFLICT_COMMENT=$(get_conflict_comment "$PR16_URL" "$PR16_NUM" 1)
 assert_conflict_comment_merges "$PR16_CONFLICT_COMMENT" "origin/feature15"
-follow_conflict_comment "$PR16_CONFLICT_COMMENT" file.txt "feature16's side" 1
+follow_conflict_comment "$PR16_CONFLICT_COMMENT" file.txt "feature16" 1
 if ! wait_for_synchronize_workflow "$PR16_NUM" "feature16" "success"; then
     echo >&2 "Continuation workflow for feature16 did not complete successfully."
     exit 1
@@ -1760,7 +1713,7 @@ else
 fi
 assert_pr_changed_lines "$PR16_URL" "PR16 diff contains only its resolved base conflict" "$(cat <<'EOF'
 -Feature 15 base conflict line 9
-+Feature 16 base conflict line 9
++Conflict resolved on feature16
 EOF
 )"
 
@@ -1770,33 +1723,20 @@ log_cmd git checkout main
 log_cmd git pull origin main
 
 log_cmd git checkout -b feature17 main
-sed -i '8s/.*/Feature 17 content line 8/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 17"
-log_cmd git push origin feature17
-PR17_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature17 --title "Feature 17" --body "Base and trunk conflict parent")
-PR17_NUM=$(echo "$PR17_URL" | awk -F'/' '{print $NF}')
+edit_and_commit "Add feature 17" 8 "Feature 17 content line 8"
+create_pr feature17 main "Feature 17" "Base and trunk conflict parent" PR17_URL PR17_NUM
 
 log_cmd git checkout -b feature18 feature17
-sed -i '9s/.*/Feature 18 base conflict line 9/' file.txt
-sed -i '13s/.*/Feature 18 trunk conflict line 13/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 18"
+edit_and_commit "Add feature 18" 9 "Feature 18 base conflict line 9" 13 "Feature 18 trunk conflict line 13"
 FEATURE18_BEFORE_CONFLICT=$(git rev-parse HEAD)
-log_cmd git push origin feature18
-PR18_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature17 --head feature18 --title "Feature 18" --body "Base and trunk conflict child")
-PR18_NUM=$(echo "$PR18_URL" | awk -F'/' '{print $NF}')
+create_pr feature18 feature17 "Feature 18" "Base and trunk conflict child" PR18_URL PR18_NUM
 
 log_cmd git checkout feature17
-sed -i '9s/.*/Feature 17 base conflict line 9/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Create base conflict for feature18"
+edit_and_commit "Create base conflict for feature18" 9 "Feature 17 base conflict line 9"
 log_cmd git push origin feature17
 
 log_cmd git checkout main
-sed -i '13s/.*/Main trunk conflict line 13/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Create trunk conflict for feature18"
+edit_and_commit "Create trunk conflict for feature18" 13 "Main trunk conflict line 13"
 log_cmd git push origin main
 
 merge_pr_with_retry "$PR17_URL"
@@ -1816,16 +1756,16 @@ fi
 PR18_CONFLICT_COMMENT=$(get_conflict_comment "$PR18_URL" "$PR18_NUM" 1)
 PRE_SQUASH_COMMIT17=$(git rev-parse "$MERGE_COMMIT_SHA17~")
 assert_conflict_comment_merges "$PR18_CONFLICT_COMMENT" "origin/feature17" "$PRE_SQUASH_COMMIT17"
-follow_conflict_comment "$PR18_CONFLICT_COMMENT" file.txt "feature18's side" 2
+follow_conflict_comment "$PR18_CONFLICT_COMMENT" file.txt "feature18" 2
 if ! wait_for_synchronize_workflow "$PR18_NUM" "feature18" "success"; then
     echo >&2 "Continuation workflow for feature18 did not complete successfully."
     exit 1
 fi
 assert_pr_changed_lines "$PR18_URL" "PR18 diff contains only its two resolved conflicts" "$(cat <<'EOF'
 -Feature 17 base conflict line 9
-+Feature 18 base conflict line 9
++Conflict resolved on feature18
 -Main trunk conflict line 13
-+Feature 18 trunk conflict line 13
++Conflict resolved on feature18
 EOF
 )"
 
@@ -1835,32 +1775,20 @@ log_cmd git checkout main
 log_cmd git pull origin main
 
 log_cmd git checkout -b feature19 main
-sed -i '8s/.*/Feature 19 content line 8/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 19"
-log_cmd git push origin feature19
-PR19_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base main --head feature19 --title "Feature 19" --body "Follow-up trunk conflict parent")
-PR19_NUM=$(echo "$PR19_URL" | awk -F'/' '{print $NF}')
+edit_and_commit "Add feature 19" 8 "Feature 19 content line 8"
+create_pr feature19 main "Feature 19" "Follow-up trunk conflict parent" PR19_URL PR19_NUM
 
 log_cmd git checkout -b feature20 feature19
-sed -i '9s/.*/Feature 20 base conflict line 9/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Add feature 20"
+edit_and_commit "Add feature 20" 9 "Feature 20 base conflict line 9"
 FEATURE20_BEFORE_CONFLICT=$(git rev-parse HEAD)
-log_cmd git push origin feature20
-PR20_URL=$(log_cmd gh pr create --repo "$REPO_FULL_NAME" --base feature19 --head feature20 --title "Feature 20" --body "Follow-up trunk conflict child")
-PR20_NUM=$(echo "$PR20_URL" | awk -F'/' '{print $NF}')
+create_pr feature20 feature19 "Feature 20" "Follow-up trunk conflict child" PR20_URL PR20_NUM
 
 log_cmd git checkout feature19
-sed -i '9s/.*/Feature 19 base conflict line 9/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Create base conflict for feature20"
+edit_and_commit "Create base conflict for feature20" 9 "Feature 19 base conflict line 9"
 log_cmd git push origin feature19
 
 log_cmd git checkout main
-sed -i '13s/.*/Main follow-up trunk conflict line 13/' file.txt
-log_cmd git add file.txt
-log_cmd git commit -m "Create follow-up trunk conflict for feature20"
+edit_and_commit "Create follow-up trunk conflict for feature20" 13 "Main follow-up trunk conflict line 13"
 log_cmd git push origin main
 
 merge_pr_with_retry "$PR19_URL"
@@ -1881,12 +1809,10 @@ PR20_FIRST_CONFLICT_COMMENT=$(get_conflict_comment "$PR20_URL" "$PR20_NUM" 1)
 assert_conflict_comment_merges "$PR20_FIRST_CONFLICT_COMMENT" "origin/feature19"
 
 introduce_feature20_trunk_conflict_before_push() {
-    sed -i '13s/.*/Feature 20 follow-up trunk conflict line 13/' file.txt
-    log_cmd git add file.txt
-    log_cmd git commit -m "Introduce follow-up trunk conflict"
+    edit_and_commit "Introduce follow-up trunk conflict" 13 "Feature 20 follow-up trunk conflict line 13"
 }
 
-follow_conflict_comment "$PR20_FIRST_CONFLICT_COMMENT" file.txt "feature20's side" 1 introduce_feature20_trunk_conflict_before_push
+follow_conflict_comment "$PR20_FIRST_CONFLICT_COMMENT" file.txt "feature20" 1 introduce_feature20_trunk_conflict_before_push
 if ! wait_for_synchronize_workflow "$PR20_NUM" "feature20" "failure"; then
     echo >&2 "Expected continuation workflow for feature20 to fail with a new trunk conflict."
     exit 1
@@ -1894,16 +1820,16 @@ fi
 PR20_SECOND_CONFLICT_COMMENT=$(get_conflict_comment "$PR20_URL" "$PR20_NUM" 2)
 PRE_SQUASH_COMMIT19=$(git rev-parse "$MERGE_COMMIT_SHA19~")
 assert_conflict_comment_merges "$PR20_SECOND_CONFLICT_COMMENT" "$PRE_SQUASH_COMMIT19"
-follow_conflict_comment "$PR20_SECOND_CONFLICT_COMMENT" file.txt "feature20's side" 1
+follow_conflict_comment "$PR20_SECOND_CONFLICT_COMMENT" file.txt "feature20" 1
 if ! wait_for_synchronize_workflow "$PR20_NUM" "feature20" "success"; then
     echo >&2 "Continuation workflow for feature20 did not complete successfully after trunk conflict resolution."
     exit 1
 fi
 assert_pr_changed_lines "$PR20_URL" "PR20 diff contains only the base and follow-up trunk resolutions" "$(cat <<'EOF'
 -Feature 19 base conflict line 9
-+Feature 20 base conflict line 9
++Conflict resolved on feature20
 -Main follow-up trunk conflict line 13
-+Feature 20 follow-up trunk conflict line 13
++Conflict resolved on feature20
 EOF
 )"
 
