@@ -74,17 +74,6 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
-format_branch_list_for_text() {
-    for ((i=1; i<=$#; i++)); do
-        case $i in
-            1) format='`%s`';;
-            $#) format=', and `%s`';;
-            *) format=', `%s`';;
-        esac
-        printf "$format" "${!i}"
-    done
-}
-
 update_direct_target() {
     local BRANCH="$1"
     local BASE_BRANCH="$2"
@@ -113,7 +102,7 @@ update_direct_target() {
     # included in the merged branch — otherwise the first merge covers it.
     if ! git merge-base --is-ancestor SQUASH_COMMIT~ "origin/$MERGED_BRANCH"; then
         if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
-            CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)" )
+            CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)  # $TARGET_BRANCH just before $MERGED_BRANCH was merged" )
             log_cmd git merge --abort
         fi
     fi
@@ -134,10 +123,6 @@ update_direct_target() {
         fi
         {
             echo "### ⚠️ Automatic update blocked by merge conflicts"
-            echo
-            echo -n "I tried to merge "
-            format_branch_list_for_text "${CONFLICTS[@]}"
-            echo " into this branch while updating the pull request stack and hit conflicts."
             echo
             echo "#### How to resolve"
             echo '```bash'
