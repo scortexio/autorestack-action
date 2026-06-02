@@ -17,6 +17,7 @@ jobs:
           bash tests/test_update_pr_stack.sh
           bash tests/test_rebase_workflow.sh
           bash tests/test_mixed_workflows.sh
+          bash tests/test_conflict_resolution_resume.sh
 
   e2e-tests:
     name: E2E Tests

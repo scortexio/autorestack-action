@@ -21,6 +21,35 @@ source "$SCRIPT_DIR/command_utils.sh"
 
 CONFLICT_LABEL="autorestack-needs-conflict-resolution"
 
+# Machine-readable marker embedded (invisibly) in the conflict comment so the
+# conflict-resolved run can recover the exact stack state it recorded, instead of
+# re-deriving the parent PR from the PR's current base branch (which breaks when
+# anything about that base changes, e.g. a human retargeting the PR manually).
+STATE_MARKER_PREFIX="<!-- autorestack-state:"
+
+# Args: base-branch target-branch squash-hash. Branch names and hashes contain no
+# spaces, so a space-separated key=value list parses back unambiguously.
+format_state_marker() {
+    printf '%s base=%s target=%s squash=%s -->' \
+        "$STATE_MARKER_PREFIX" "$1" "$2" "$3"
+}
+
+# Echoes the most recent state-marker line found in our PR comments, or nothing.
+read_state_marker() {
+    local PR_BRANCH="$1"
+    gh pr view "$PR_BRANCH" --json comments --jq '.comments[].body' 2>/dev/null \
+        | { grep -F "$STATE_MARKER_PREFIX" || true; } | tail -n1
+}
+
+# Args: a marker line. Echoes "base target squash".
+parse_state_marker() {
+    local LINE="$1"
+    printf '%s %s %s\n' \
+        "$(sed -n 's/.* base=\([^ ]*\).*/\1/p' <<<"$LINE")" \
+        "$(sed -n 's/.* target=\([^ ]*\).*/\1/p' <<<"$LINE")" \
+        "$(sed -n 's/.* squash=\([^ ]*\).*/\1/p' <<<"$LINE")"
+}
+
 # Allow replacing git and gh
 [ -v GIT ] && git() { "$GIT" "$@"; }
 [ -v GH ] && gh() { "$GH" "$@"; }
@@ -128,6 +157,8 @@ update_direct_target() {
             echo '```'
             echo
             echo "Once you push, this action will resume and finish updating this pull request."
+            echo
+            format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
         } | log_cmd gh pr comment "$BRANCH" -F -
         # Create the label if it doesn't exist, then add it to the PR
         gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
@@ -176,6 +207,16 @@ has_sibling_conflicts() {
     return 1  # No siblings with same base
 }
 
+# Give up on resuming the stack update: tell the user why on the PR, then drop
+# the conflict label so this action stops re-triggering. Used for the dead-end
+# cases where we cannot or must not finish automatically.
+abandon_resume() {
+    local PR_BRANCH="$1"
+    local MESSAGE="$2"
+    echo "$MESSAGE" | log_cmd gh pr comment "$PR_BRANCH" -F -
+    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+}
+
 # Continue processing after user manually resolved conflicts
 continue_after_resolution() {
     check_env_var "PR_BRANCH"
@@ -190,54 +231,75 @@ continue_after_resolution() {
 
     echo "Found conflict label on $PR_BRANCH, continuing stack update..."
 
-    # Get the current base branch (the old base that was kept during conflict)
-    local OLD_BASE
-    OLD_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
-    echo "Current base branch: $OLD_BASE"
-
     # The synchronize payload is the child PR, so SQUASH_COMMIT / MERGED_BRANCH /
     # TARGET_BRANCH from the original squash-merge run are not in the environment.
-    # Reconstruct them from the merged parent PR: OLD_BASE is the parent branch,
-    # and the merged PR whose head is OLD_BASE gives the new target (its base) and
-    # the squash commit (its merge commit).
-    local NEW_TARGET SQUASH_HASH
-    read -r NEW_TARGET SQUASH_HASH < <(gh pr list --head "$OLD_BASE" --state merged \
-        --json baseRefName,mergeCommit --jq '.[0] | "\(.baseRefName // "") \(.mergeCommit.oid // "")"')
+    # Recover them from the marker the squash-merge run left in the conflict
+    # comment.
+    local MARKER
+    MARKER=$(read_state_marker "$PR_BRANCH")
+    if [[ -z "$MARKER" ]]; then
+        echo "⚠️ No autorestack state marker on $PR_BRANCH; cannot resume safely. Removing the label."
+        abandon_resume "$PR_BRANCH" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
+        return
+    fi
 
-    if [[ -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
-        echo "⚠️ Could not find where '$OLD_BASE' was merged to; skipping base branch and deletion updates"
-        # Don't update base or delete old branch - leave things as they are
+    local OLD_BASE NEW_TARGET SQUASH_HASH
+    read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
+    echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
+
+    # The base we left the PR on while waiting for conflict resolution was the
+    # merged parent branch. If it no longer matches, a human retargeted the PR
+    # (e.g. straight onto the integration branch); we are no longer the authority
+    # on its base, so we step back without touching the branch. This runs before
+    # any mutation: once the base diverges, the recorded target is stale and a
+    # merge built against it would be wrong.
+    local CURRENT_BASE
+    CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
+    if [[ "$CURRENT_BASE" != "$OLD_BASE" ]]; then
+        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $CURRENT_BASE); not updating the stack."
+        abandon_resume "$PR_BRANCH" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
+        return
+    fi
+
+    # Defense in depth: never act on a target branch that no longer exists. The
+    # action checks out with full history (fetch-depth: 0), so a missing origin
+    # ref means the branch is really gone, not just unfetched; no future resume
+    # can succeed, so give up cleanly rather than stranding the PR under the label.
+    if ! git rev-parse --verify --quiet "origin/$NEW_TARGET" >/dev/null; then
+        echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; abandoning resume of $PR_BRANCH."
+        abandon_resume "$PR_BRANCH" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
+        return
+    fi
+
+    # The squash-merge run pushed the base merge and asked the user to resolve the
+    # pre-squash merge, but it never recorded the squash itself. Finish that now:
+    # re-run the same merge sequence as the squash-merge path. With the user's
+    # resolution in place the base merge and pre-squash merge are no-ops; only the
+    # "-s ours" squash record gets applied, keeping the diff against the new base
+    # clean. has_squash_commit makes this idempotent.
+    log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
+    MERGED_BRANCH="$OLD_BASE"
+    TARGET_BRANCH="$NEW_TARGET"
+    if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
+        echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
+        return 1
+    fi
+
+    # Drop the label last: it is what re-triggers this action, so while any
+    # earlier step can still fail it must stay on to let the next push resume.
+    # Push the cleaned-up head before retargeting so the head already contains
+    # NEW_TARGET when the base flips to it, keeping the PR mergeable (GitHub
+    # suppresses CI on a PR that conflicts with its base).
+    log_cmd git push origin "$PR_BRANCH"
+    log_cmd gh pr edit "$PR_BRANCH" --base "$NEW_TARGET"
+    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+
+    # Check if old base branch should be deleted
+    if has_sibling_conflicts "$OLD_BASE" "$PR_BRANCH"; then
+        echo "⚠️ Keeping branch '$OLD_BASE' - still referenced by other conflicted PRs"
     else
-        echo "Old base '$OLD_BASE' was merged to '$NEW_TARGET' as $SQUASH_HASH"
-
-        # The squash-merge run pushed the base merge and asked the user to resolve
-        # the pre-squash merge, but it never recorded the squash itself. Finish
-        # that now: re-run the same merge sequence as the squash-merge path. With
-        # the user's resolution in place the base merge and pre-squash merge are
-        # no-ops; only the "-s ours" squash record gets applied, keeping the diff
-        # against the new base clean. has_squash_commit makes this idempotent.
-        log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
-        MERGED_BRANCH="$OLD_BASE"
-        TARGET_BRANCH="$NEW_TARGET"
-        if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
-            echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
-            return 1
-        fi
-        log_cmd git push origin "$PR_BRANCH"
-
-        # Remove the conflict label
-        log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
-
-        # Update the PR's base branch to the new target
-        log_cmd gh pr edit "$PR_BRANCH" --base "$NEW_TARGET"
-
-        # Check if old base branch should be deleted
-        if has_sibling_conflicts "$OLD_BASE" "$PR_BRANCH"; then
-            echo "⚠️ Keeping branch '$OLD_BASE' - still referenced by other conflicted PRs"
-        else
-            echo "Deleting old base branch '$OLD_BASE' (no other PRs depend on it)"
-            log_cmd git push origin ":$OLD_BASE" || echo "⚠️ Could not delete '$OLD_BASE' (may already be deleted)"
-        fi
+        echo "Deleting old base branch '$OLD_BASE' (no other PRs depend on it)"
+        log_cmd git push origin ":$OLD_BASE" || echo "⚠️ Could not delete '$OLD_BASE' (may already be deleted)"
     fi
 }
 
