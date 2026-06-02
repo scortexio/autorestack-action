@@ -22,11 +22,9 @@ source "$SCRIPT_DIR/command_utils.sh"
 CONFLICT_LABEL="autorestack-needs-conflict-resolution"
 
 # Machine-readable marker embedded (invisibly) in the conflict comment so the
-# conflict-resolved run can recover the exact stack state. We rely on this rather
-# than re-deriving it from `gh pr list --head <base>`: when the base is a
-# long-lived integration branch that heuristic returns an unrelated ancient merge
-# (e.g. a years-old release merge), and it cannot tell whether a human retargeted
-# the PR in the meantime.
+# conflict-resolved run can recover the exact stack state it recorded, instead of
+# re-deriving the parent PR from the PR's current base branch (which breaks when
+# anything about that base changes, e.g. a human retargeting the PR manually).
 STATE_MARKER_PREFIX="<!-- autorestack-state:"
 
 # Args: base-branch target-branch squash-hash. Branch names and hashes contain no
