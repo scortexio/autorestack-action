@@ -243,9 +243,9 @@ continue_after_resolution() {
         return
     fi
 
-    local RECORDED_BASE NEW_TARGET SQUASH_HASH
-    read -r RECORDED_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
-    echo "Recorded state: base=$RECORDED_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
+    local OLD_BASE NEW_TARGET SQUASH_HASH
+    read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
+    echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
 
     # The base we left the PR on while waiting for conflict resolution was the
     # merged parent branch. If it no longer matches, a human retargeted the PR
@@ -255,8 +255,8 @@ continue_after_resolution() {
     # merge built against it would be wrong.
     local CURRENT_BASE
     CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
-    if [[ "$CURRENT_BASE" != "$RECORDED_BASE" ]]; then
-        echo "⚠️ Base of $PR_BRANCH changed manually ($RECORDED_BASE -> $CURRENT_BASE); not updating the stack."
+    if [[ "$CURRENT_BASE" != "$OLD_BASE" ]]; then
+        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $CURRENT_BASE); not updating the stack."
         abandon_resume "$PR_BRANCH" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
         return
     fi
@@ -278,7 +278,7 @@ continue_after_resolution() {
     # "-s ours" squash record gets applied, keeping the diff against the new base
     # clean. has_squash_commit makes this idempotent.
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
-    MERGED_BRANCH="$RECORDED_BASE"
+    MERGED_BRANCH="$OLD_BASE"
     TARGET_BRANCH="$NEW_TARGET"
     if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
         echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
@@ -295,11 +295,11 @@ continue_after_resolution() {
     log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
 
     # Check if old base branch should be deleted
-    if has_sibling_conflicts "$RECORDED_BASE" "$PR_BRANCH"; then
-        echo "⚠️ Keeping branch '$RECORDED_BASE' - still referenced by other conflicted PRs"
+    if has_sibling_conflicts "$OLD_BASE" "$PR_BRANCH"; then
+        echo "⚠️ Keeping branch '$OLD_BASE' - still referenced by other conflicted PRs"
     else
-        echo "Deleting old base branch '$RECORDED_BASE' (no other PRs depend on it)"
-        log_cmd git push origin ":$RECORDED_BASE" || echo "⚠️ Could not delete '$RECORDED_BASE' (may already be deleted)"
+        echo "Deleting old base branch '$OLD_BASE' (no other PRs depend on it)"
+        log_cmd git push origin ":$OLD_BASE" || echo "⚠️ Could not delete '$OLD_BASE' (may already be deleted)"
     fi
 }
 
