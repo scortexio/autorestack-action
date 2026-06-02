@@ -36,9 +36,10 @@ When a merge conflict occurs during the automatic update:
 After you manually resolve the conflict and push:
 
 1. The push triggers the `synchronize` event
-2. The action detects the conflict label and removes it
+2. The action detects the conflict label
 3. Updates the PR's base branch to trunk
-4. Deletes the old base branch (if no other conflicted PRs still depend on it)
+4. Removes the conflict label
+5. Deletes the old base branch (if no other conflicted PRs still depend on it)
 
 ---
 
