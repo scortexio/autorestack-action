@@ -5,9 +5,9 @@
 # Focus: the run that resumes after a user pushes a conflict resolution must
 # recover its state from the marker left in the conflict comment, and must NOT
 # mutate the PR when the recorded state no longer applies (no marker, or the user
-# manually retargeted the base). A previous version re-derived the state from
-# `gh pr list` and, on a long-lived base, pushed a merge built against a
-# non-existent branch before crashing.
+# manually retargeted the base). A previous version re-derived the base pull
+# request from the target branch, which made it sensitive to humans doing
+# unexpected things such as changing the base branch manually.
 
 set -ueo pipefail
 
