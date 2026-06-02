@@ -207,6 +207,16 @@ has_sibling_conflicts() {
     return 1  # No siblings with same base
 }
 
+# Give up on resuming the stack update: tell the user why on the PR, then drop
+# the conflict label so this action stops re-triggering. Used for the dead-end
+# cases where we cannot or must not finish automatically.
+abandon_resume() {
+    local PR_BRANCH="$1"
+    local MESSAGE="$2"
+    echo "$MESSAGE" | log_cmd gh pr comment "$PR_BRANCH" -F -
+    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+}
+
 # Continue processing after user manually resolved conflicts
 continue_after_resolution() {
     check_env_var "PR_BRANCH"
@@ -229,9 +239,7 @@ continue_after_resolution() {
     MARKER=$(read_state_marker "$PR_BRANCH")
     if [[ -z "$MARKER" ]]; then
         echo "⚠️ No autorestack state marker on $PR_BRANCH; cannot resume safely. Removing the label."
-        { echo "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, do it manually."; } \
-            | log_cmd gh pr comment "$PR_BRANCH" -F -
-        log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+        abandon_resume "$PR_BRANCH" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
         return
     fi
 
@@ -249,15 +257,17 @@ continue_after_resolution() {
     CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
     if [[ "$CURRENT_BASE" != "$RECORDED_BASE" ]]; then
         echo "⚠️ Base of $PR_BRANCH changed manually ($RECORDED_BASE -> $CURRENT_BASE); not updating the stack."
-        { echo "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."; } \
-            | log_cmd gh pr comment "$PR_BRANCH" -F -
-        log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+        abandon_resume "$PR_BRANCH" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
         return
     fi
 
-    # Defense in depth: never act on a target branch that no longer exists.
+    # Defense in depth: never act on a target branch that no longer exists. The
+    # action checks out with full history (fetch-depth: 0), so a missing origin
+    # ref means the branch is really gone, not just unfetched; no future resume
+    # can succeed, so give up cleanly rather than stranding the PR under the label.
     if ! git rev-parse --verify --quiet "origin/$NEW_TARGET" >/dev/null; then
-        echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; leaving $PR_BRANCH untouched."
+        echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; abandoning resume of $PR_BRANCH."
+        abandon_resume "$PR_BRANCH" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
         return
     fi
 

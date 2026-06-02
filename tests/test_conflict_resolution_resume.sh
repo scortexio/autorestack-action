@@ -136,5 +136,20 @@ label_line=$(grep -n "remove-label" "$CALLS" | head -1 | cut -d: -f1)
 [[ "$base_line" -lt "$label_line" ]] || fail "C: base edit must come before label removal"
 ok "C: resume retargets base then removes label"
 
+# ---------------------------------------------------------------------------
+echo "### Scenario D: recorded target branch is gone -> give up cleanly"
+setup_repo
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+MOCK_BASE="parent"   # matches marker -> not a manual retarget
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent ghost-target "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "D: label not removed"
+grep -q "gh pr comment" "$CALLS" || fail "D: no explanatory comment posted"
+grep -q -- "--base" "$CALLS" && fail "D: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "D: child was pushed"
+ok "D: missing target detected, no branch mutation, label removed"
+
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"
