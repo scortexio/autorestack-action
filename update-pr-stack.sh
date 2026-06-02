@@ -250,9 +250,9 @@ continue_after_resolution() {
     # The base we left the PR on while waiting for conflict resolution was the
     # merged parent branch. If it no longer matches, a human retargeted the PR
     # (e.g. straight onto the integration branch); we are no longer the authority
-    # on its base, so we step back without touching the branch. Doing this BEFORE
-    # any mutation is what stops the failure mode where we pushed a merge built
-    # against a bogus target and then crashed.
+    # on its base, so we step back without touching the branch. This runs before
+    # any mutation: once the base diverges, the recorded target is stale and a
+    # merge built against it would be wrong.
     local CURRENT_BASE
     CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
     if [[ "$CURRENT_BASE" != "$RECORDED_BASE" ]]; then
@@ -285,9 +285,11 @@ continue_after_resolution() {
         return 1
     fi
 
-    # Order matters: push the cleaned-up head, then retarget the base, and only
-    # then drop the label. The retarget is the step that previously failed; if
-    # anything here fails the label stays, so the next push resumes.
+    # Drop the label last: it is what re-triggers this action, so while any
+    # earlier step can still fail it must stay on to let the next push resume.
+    # Push the cleaned-up head before retargeting so the head already contains
+    # NEW_TARGET when the base flips to it, keeping the PR mergeable (GitHub
+    # suppresses CI on a PR that conflicts with its base).
     log_cmd git push origin "$PR_BRANCH"
     log_cmd gh pr edit "$PR_BRANCH" --base "$NEW_TARGET"
     log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
