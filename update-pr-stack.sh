@@ -124,7 +124,7 @@ update_direct_target() {
         {
             echo "### ⚠️ Automatic update blocked by merge conflicts"
             echo
-            echo "#### How to resolve"
+            echo "Resolve them like this:"
             echo '```bash'
             echo "git fetch origin"
             echo "git switch $BRANCH"
