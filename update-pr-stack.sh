@@ -128,7 +128,7 @@ update_direct_target() {
             echo '```bash'
             echo "git fetch origin"
             echo "git switch $BRANCH"
-            echo "git pull origin $BRANCH"
+            echo "git merge --ff-only origin/$BRANCH"
 
             for i in "${!CONFLICTS[@]}"; do
                 echo "git merge ${CONFLICTS[$i]}"
