@@ -124,7 +124,7 @@ jobs:
 
 ### Notes
 
-* Currently only supports squash merges
+* Currently only supports squash merges; PRs merged with a merge commit are detected and skipped (history isn't rewritten, so stacked PRs stay valid as-is)
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
 

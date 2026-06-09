@@ -301,6 +301,12 @@ main() {
 
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
 
+    # A merge-commit merge does not rewrite history; stacked PRs stay valid.
+    if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
+        echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; nothing to do"
+        return 0
+    fi
+
     # Find all PRs directly targeting the merged PR's head
     INITIAL_NUMBERS=()
     INITIAL_TARGETS=()
