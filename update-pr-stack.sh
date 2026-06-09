@@ -40,10 +40,16 @@ format_state_marker() {
 }
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
+# A failed comments fetch aborts the run: treating it as "no marker" would make
+# the caller abandon the resume and drop the conflict label for good.
 read_state_marker() {
     local PR_NUMBER="$1"
-    gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' 2>/dev/null \
-        | { grep -F "$STATE_MARKER_PREFIX" || true; } | tail -n1
+    local BODIES
+    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body'); then
+        echo "Error: could not read comments of PR #$PR_NUMBER" >&2
+        exit 1
+    fi
+    { grep -F "$STATE_MARKER_PREFIX" <<<"$BODIES" || true; } | tail -n1
 }
 
 # Args: a marker line. Echoes "base target squash".
@@ -173,11 +179,15 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     return 0
 }
 
-# Check if a PR has the conflict resolution label
+# Check if a PR has the conflict resolution label. A failed labels fetch aborts
+# the run rather than reading as "no label", which would silently skip a resume.
 pr_has_conflict_label() {
     local PR_NUMBER="$1"
     local LABELS
-    LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+    if ! LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name'); then
+        echo "Error: could not read labels of PR #$PR_NUMBER" >&2
+        exit 1
+    fi
     echo "$LABELS" | grep -q "^${CONFLICT_LABEL}$"
 }
 
