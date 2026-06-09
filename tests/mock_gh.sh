@@ -14,8 +14,8 @@ if [[ "$1" == "pr" && "$2" == "list" ]]; then
     done
 
     if [[ "$base" == "feature1" ]]; then
-        # feature2 is a direct child of feature1
-        echo 'feature2'
+        # feature2 is a direct child of feature1 (PR #2)
+        echo '2 feature2'
     else
         # No other bases have direct children in our test scenario
         :

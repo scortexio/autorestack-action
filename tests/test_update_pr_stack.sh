@@ -89,7 +89,7 @@ run_update_pr_stack
 # the PR untouched on its old base), and the merged branch deleted only after
 # the retarget (deleting a PR's base branch closes the PR).
 push_line=$(grep -n "git push origin feature2" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
-edit_line=$(grep -n "pr edit feature2 --base main" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
+edit_line=$(grep -n "pr edit 2 --base main" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
 delete_line=$(grep -n "git push origin :feature1" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
 if [[ -n "$push_line" && -n "$edit_line" && -n "$delete_line" \
       && "$push_line" -lt "$edit_line" && "$edit_line" -lt "$delete_line" ]]; then

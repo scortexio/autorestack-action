@@ -54,6 +54,8 @@ runs:
         MERGED_BRANCH: ${{ github.event.pull_request.head.ref }}
         TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
         PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_BASE: ${{ github.event.pull_request.base.ref }}
       run: |
         echo "Running in $ACTION_MODE mode"
         ${{ github.action_path }}/update-pr-stack.sh

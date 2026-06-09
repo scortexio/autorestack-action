@@ -21,8 +21,9 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 # Build a configurable gh mock in a temp dir. It records every invocation to
 # $CALLS and is driven by env vars set per scenario:
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
-#   MOCK_BASE           base branch returned by `pr view --json baseRefName`
 #   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
+# The PR's base branch is not mocked: the script must take it from PR_BASE
+# (event payload), so a baseRefName query is an unhandled call and fails.
 make_mock_gh() {
     local dir="$1"
     cat > "$dir/mock_gh.sh" <<'EOF'
@@ -32,7 +33,6 @@ echo "gh $*" >> "$CALLS"
 if [[ "$1 $2" == "pr view" ]]; then
     case "$*" in
         *--json\ labels*)   printf '%s\n' "${MOCK_LABELS:-}";;
-        *--json\ baseRefName*) printf '%s\n' "${MOCK_BASE:-}";;
         *--json\ comments*) cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
@@ -88,9 +88,9 @@ setup_repo() {
 }
 
 run_resume() {
-    env ACTION_MODE=conflict-resolved PR_BRANCH=child \
+    env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
-        MOCK_LABELS="$MOCK_LABELS" MOCK_BASE="$MOCK_BASE" \
+        MOCK_LABELS="$MOCK_LABELS" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
         bash "$ROOT_DIR/update-pr-stack.sh" >"$WORK/out.log" 2>&1 || echo "EXIT=$?" >>"$WORK/out.log"
 }
@@ -103,7 +103,7 @@ marker() { # base target squash
 echo "### Scenario A: user manually retargeted the base -> no mutation"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="spark"   # human changed it; marker says parent
+PR_BASE="spark"   # human changed it; marker says parent
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
@@ -119,7 +119,7 @@ ok "A: manual retarget detected, no branch mutation, label removed"
 echo "### Scenario B: no state marker -> no mutation"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"
+PR_BASE="parent"
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### some old conflict comment with no marker"; } > "$MOCK_COMMENTS_FILE"
 run_resume
@@ -137,13 +137,13 @@ setup_repo
 git -C "$WORK" merge -q --no-edit main
 git -C "$WORK" push -q origin child
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"   # matches marker -> not a manual retarget
+PR_BASE="parent"   # matches marker -> not a manual retarget
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
 grep -q -- "git push origin child" "$CALLS" || fail "C: child not pushed"
-grep -q -- "pr edit child --base main" "$CALLS" || fail "C: base not retargeted to main"
+grep -q -- "pr edit 5 --base main" "$CALLS" || fail "C: base not retargeted to main"
 grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "C: label not removed"
 push_line=$(grep -n -- "git push origin child" "$CALLS" | head -1 | cut -d: -f1)
 base_line=$(grep -n -- "--base main" "$CALLS" | head -1 | cut -d: -f1)
@@ -156,7 +156,7 @@ ok "C: resume pushes, retargets base, then removes label"
 echo "### Scenario D: recorded target branch is gone -> give up cleanly"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"   # matches marker -> not a manual retarget
+PR_BASE="parent"   # matches marker -> not a manual retarget
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent ghost-target "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
