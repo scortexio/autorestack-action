@@ -291,7 +291,7 @@ assert_conflict_comment_merges() {
         expected+="git merge $conflict"$'\n'
     done
     expected=${expected%$'\n'}
-    actual=$(echo "$comment" | grep -E '^git merge' | sed 's/ *#.*//' || true)
+    actual=$(echo "$comment" | grep -E '^git merge' | grep -v -- '--ff-only' | sed 's/ *#.*//' || true)
 
     if [[ "$actual" == "$expected" ]]; then
         echo >&2 "✅ Verification Passed: conflict comment lists expected merge command(s)."
