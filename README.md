@@ -79,6 +79,10 @@ on:
   pull_request:
     types: [closed, synchronize]
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -109,6 +113,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 jobs:
   update-pr-stack:
