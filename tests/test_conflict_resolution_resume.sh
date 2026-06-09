@@ -23,6 +23,8 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
 #   MOCK_BASE           base branch returned by `pr view --json baseRefName`
 #   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
+#   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
+#   MOCK_PR_LIST_FAIL   set to 1 to make `pr list` fail
 make_mock_gh() {
     local dir="$1"
     cat > "$dir/mock_gh.sh" <<'EOF'
@@ -31,7 +33,9 @@ set -ueo pipefail
 echo "gh $*" >> "$CALLS"
 if [[ "$1 $2" == "pr view" ]]; then
     case "$*" in
-        *--json\ labels*)   printf '%s\n' "${MOCK_LABELS:-}";;
+        *--json\ labels*)
+            [[ "${MOCK_LABELS_FAIL:-}" == 1 ]] && { echo "mock gh: labels API down" >&2; exit 1; }
+            printf '%s\n' "${MOCK_LABELS:-}";;
         *--json\ baseRefName*) printf '%s\n' "${MOCK_BASE:-}";;
         *--json\ comments*) cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
@@ -41,6 +45,7 @@ elif [[ "$1 $2" == "pr comment" ]]; then
 elif [[ "$1 $2" == "pr edit" ]]; then
     :
 elif [[ "$1 $2" == "pr list" ]]; then
+    [[ "${MOCK_PR_LIST_FAIL:-}" == 1 ]] && { echo "mock gh: pr list API down" >&2; exit 1; }
     :  # no sibling conflicts
 elif [[ "$1 $2" == "label create" ]]; then
     :
@@ -92,6 +97,7 @@ run_resume() {
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
         MOCK_LABELS="$MOCK_LABELS" MOCK_BASE="$MOCK_BASE" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
+        MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" MOCK_PR_LIST_FAIL="${MOCK_PR_LIST_FAIL:-}" \
         bash "$ROOT_DIR/update-pr-stack.sh" >"$WORK/out.log" 2>&1 || echo "EXIT=$?" >>"$WORK/out.log"
 }
 
@@ -196,6 +202,61 @@ grep -q "gh pr comment" "$CALLS" || fail "E: no explanatory comment posted"
 grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
 ok "E: missing base branch detected, no crash, label removed"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario F: reading the PR comments fails -> fail the run, keep the label"
+setup_repo
+# A transient API failure while reading the comments must not pass for "no
+# state marker": that path removes the conflict label and permanently cancels
+# the auto-resume. The run must fail loudly instead, so the next push retries.
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+MOCK_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/does-not-exist"   # makes the mock gh fail on pr view --json comments
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "F: run should have failed"
+grep -q "remove-label" "$CALLS" && fail "F: label must NOT be removed on an API failure"
+grep -q "gh pr comment" "$CALLS" && fail "F: no comment must be posted on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "F: child was pushed"
+ok "F: API failure fails the run and keeps the resume armed"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario G: reading the labels fails -> fail the run, do nothing"
+setup_repo
+# An API failure must not pass for "no conflict label": that ends the run
+# green without resuming anything.
+MOCK_LABELS=""
+MOCK_LABELS_FAIL=1
+MOCK_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "G: run should have failed, not ended green"
+grep -q "remove-label" "$CALLS" && fail "G: label must NOT be touched on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "G: child was pushed"
+ok "G: labels API failure fails the run instead of skipping the resume"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario H: listing sibling conflicts fails -> keep the old base branch"
+setup_repo
+# Same successful-resume setup as scenario C, but the sibling listing that
+# decides whether the old base branch can be deleted fails. Answering "no
+# siblings" there would delete a branch another conflicted PR still needs.
+git -C "$WORK" merge -q --no-edit main
+git -C "$WORK" push -q origin child
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+MOCK_LABELS_FAIL=""
+MOCK_BASE="parent"
+MOCK_PR_LIST_FAIL=1
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed"
+git -C "$ORIGIN" rev-parse --verify -q parent >/dev/null || fail "H: old base branch was deleted on an API failure"
+grep -q -- "push origin :parent" "$CALLS" && fail "H: deletion must not be attempted"
+ok "H: sibling-listing API failure keeps the old base branch"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"

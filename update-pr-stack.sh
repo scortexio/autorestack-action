@@ -39,10 +39,15 @@ format_state_marker() {
 }
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
+# Dies when the comments cannot be read at all: an API failure must not pass
+# for "no marker", which the caller treats as a reason to give up the resume
+# and remove the conflict label for good.
 read_state_marker() {
     local PR_BRANCH="$1"
-    gh pr view "$PR_BRANCH" --json comments --jq '.comments[].body' 2>/dev/null \
-        | { grep -F "$STATE_MARKER_PREFIX" || true; } | tail -n1
+    local COMMENTS
+    COMMENTS=$(gh pr view "$PR_BRANCH" --json comments --jq '.comments[].body') \
+        || die "could not read the comments of $PR_BRANCH"
+    grep -F "$STATE_MARKER_PREFIX" <<<"$COMMENTS" | tail -n1 || true
 }
 
 # Args: a marker line. Echoes "base target squash".
@@ -185,23 +190,29 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     return 0
 }
 
-# Check if a PR has the conflict resolution label
+# Check if a PR has the conflict resolution label. Dies when the labels cannot
+# be read, rather than answering "no" and letting the run end green without
+# resuming anything.
 pr_has_conflict_label() {
     local BRANCH="$1"
     local LABELS
-    LABELS=$(gh pr view "$BRANCH" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
-    echo "$LABELS" | grep -q "^${CONFLICT_LABEL}$"
+    LABELS=$(gh pr view "$BRANCH" --json labels --jq '.labels[].name') \
+        || die "could not read the labels of $BRANCH"
+    grep -q "^${CONFLICT_LABEL}$" <<<"$LABELS"
 }
 
 # Check if any other PRs with conflict label still depend on a given base branch
 # Returns 0 (true) if siblings exist, 1 (false) if no siblings
+# Dies when the PRs cannot be listed: answering "no siblings" on an API failure
+# makes the caller delete a branch a sibling may still need for its resolution.
 has_sibling_conflicts() {
     local BASE_BRANCH="$1"
     local EXCLUDE_BRANCH="$2"
 
     # Find all open PRs with the conflict label that are based on BASE_BRANCH
     local CONFLICTED_SIBLINGS
-    CONFLICTED_SIBLINGS=$(gh pr list --base "$BASE_BRANCH" --label "$CONFLICT_LABEL" --json headRefName --jq '.[].headRefName' 2>/dev/null || echo "")
+    CONFLICTED_SIBLINGS=$(gh pr list --base "$BASE_BRANCH" --label "$CONFLICT_LABEL" --json headRefName --jq '.[].headRefName') \
+        || die "could not list conflicted PRs based on $BASE_BRANCH"
 
     for SIBLING in $CONFLICTED_SIBLINGS; do
         if [[ "$SIBLING" != "$EXCLUDE_BRANCH" ]]; then
@@ -242,7 +253,7 @@ continue_after_resolution() {
     # Recover them from the marker the squash-merge run left in the conflict
     # comment.
     local MARKER
-    MARKER=$(read_state_marker "$PR_BRANCH")
+    MARKER=$(read_state_marker "$PR_BRANCH") || die "could not read the state marker of $PR_BRANCH"
     if [[ -z "$MARKER" ]]; then
         echo "⚠️ No autorestack state marker on $PR_BRANCH; cannot resume safely. Removing the label."
         abandon_resume "$PR_BRANCH" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
@@ -345,20 +356,25 @@ main() {
         fi
     done
 
-    # Only update base branches for successfully updated PRs
+    # Push the updated heads before retargeting their PRs, so each head already
+    # contains TARGET_BRANCH when the base flips to it and the PR stays
+    # mergeable (GitHub suppresses CI on a PR that conflicts with its base).
+    # Same ordering as the conflict-resolved path; it also keeps a failure
+    # between the two steps recoverable, since a retargeted PR with a stale
+    # head would sit conflicting with its new base with no label to resume it.
+    if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
+        run git push origin "${UPDATED_TARGETS[@]}"
+    fi
+
     for BRANCH in "${UPDATED_TARGETS[@]}"; do
         run gh pr edit "$BRANCH" --base "$TARGET_BRANCH"
     done
 
-    # Push updated branches; only delete merged branch if no conflicts
+    # Delete the merged branch last: open PRs must no longer be based on it
+    # when it goes away, and conflicted PRs still need it for their resolution.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        # No conflicts - safe to delete merged branch
-        run git push origin ":$MERGED_BRANCH" "${UPDATED_TARGETS[@]}"
+        run git push origin ":$MERGED_BRANCH"
     else
-        # Some conflicts - keep merged branch for reference during manual resolution
-        if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
-            run git push origin "${UPDATED_TARGETS[@]}"
-        fi
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi
 }
