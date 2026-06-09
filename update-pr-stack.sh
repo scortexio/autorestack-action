@@ -311,20 +311,26 @@ main() {
         fi
     done
 
-    # Only update base branches for successfully updated PRs
+    # Push the updated heads before retargeting, for the same reasons as the
+    # conflict-resume path: the head already contains TARGET_BRANCH when the
+    # base flips to it, keeping the PR mergeable (GitHub suppresses CI on a PR
+    # that conflicts with its base), and a failed push leaves the PR untouched
+    # on its old base instead of retargeted onto a stale head with nothing to
+    # re-trigger this action.
+    if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
+        log_cmd git push origin "${UPDATED_TARGETS[@]}"
+    fi
+
     for BRANCH in "${UPDATED_TARGETS[@]}"; do
         log_cmd gh pr edit "$BRANCH" --base "$TARGET_BRANCH"
     done
 
-    # Push updated branches; only delete merged branch if no conflicts
+    # Delete the merged branch last: deleting a PR's base branch closes the PR,
+    # so every child must be retargeted off it first. Keep it while conflicted
+    # PRs remain so it can be referenced during manual resolution.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        # No conflicts - safe to delete merged branch
-        log_cmd git push origin ":$MERGED_BRANCH" "${UPDATED_TARGETS[@]}"
+        log_cmd git push origin ":$MERGED_BRANCH"
     else
-        # Some conflicts - keep merged branch for reference during manual resolution
-        if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
-            log_cmd git push origin "${UPDATED_TARGETS[@]}"
-        fi
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi
 }
