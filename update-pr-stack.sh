@@ -39,13 +39,17 @@ format_state_marker() {
         "$STATE_MARKER_PREFIX" "$1" "$2" "$3"
 }
 
-# Echoes the most recent state-marker line found in our PR comments, or nothing.
-# A failed comments fetch aborts the run: treating it as "no marker" would make
-# the caller abandon the resume and drop the conflict label for good.
+# Echoes the most recent state-marker line found in PR comments, or nothing.
+# Only comments posted with our own token count (viewerDidAuthor): anyone can
+# comment a marker, and acting on a forged one would merge and push an
+# attacker-chosen commit. A failed comments fetch aborts the run: treating it
+# as "no marker" would make the caller abandon the resume and drop the
+# conflict label for good.
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
-    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body'); then
+    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments \
+            --jq '.comments[] | select(.viewerDidAuthor) | .body'); then
         echo "Error: could not read comments of PR #$PR_NUMBER" >&2
         exit 1
     fi
@@ -251,6 +255,12 @@ continue_after_resolution() {
     local OLD_BASE NEW_TARGET SQUASH_HASH
     read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
     echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
+
+    if [[ -z "$OLD_BASE" || -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
+        echo "⚠️ State marker on $PR_BRANCH is malformed; cannot resume safely. Removing the label."
+        abandon_resume "$PR_NUMBER" "ℹ️ autorestack found a malformed state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
+        return
+    fi
 
     # The PR was left based on the merged parent branch. If the payload shows a
     # different base, a human retargeted the PR; the recorded target is stale,
