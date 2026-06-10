@@ -6,6 +6,7 @@
 # SQUASH_COMMIT - The hash of the squash commit that was merged
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
 # TARGET_BRANCH - The name of the branch that the PR was merged into
+# PR_NUMBER - The number of the PR that was merged
 #
 # Required environment variables (conflict-resolved mode):
 # PR_BRANCH - The head branch of the PR being resumed
@@ -86,14 +87,6 @@ commit_pull_numbers() {
         || { echo "❌ Could not list the pull requests that introduced commit $1" >&2; return 1; }
 }
 
-# Args: the merged PR's number. The event payload does not say which merge
-# method was used (GitHub records it nowhere), but GitHub associates every
-# trunk commit with the PR that introduced it. A squash introduces a single
-# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
-# none; a rebase introduces a copy of each PR commit, so with two or more
-# commits the one below SQUASH_COMMIT still belongs to this PR. A
-# single-commit PR merges identically under rebase and squash and correctly
-# reads as a squash here.
 # Args: the merge commit sha, the merged PR's number. The association is
 # computed asynchronously, some time after the merge. The merge commit always
 # belongs to the merged PR, so once it shows up the index has caught up with
@@ -113,6 +106,14 @@ wait_for_pull_association() {
     exit 1
 }
 
+# Args: the merged PR's number. The event payload does not say which merge
+# method was used (GitHub records it nowhere), but GitHub associates every
+# trunk commit with the PR that introduced it. A squash introduces a single
+# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
+# none; a rebase introduces a copy of each PR commit, so with two or more
+# commits the one below SQUASH_COMMIT still belongs to this PR. A
+# single-commit PR merges identically under rebase and squash and correctly
+# reads as a squash here.
 is_rebase_merge() {
     local PR_NUMBER="$1"
     local MERGE_SHA PARENT_SHA NUMBERS
@@ -129,6 +130,11 @@ is_rebase_merge() {
         NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
     fi
     grep -qx "$PR_NUMBER" <<<"$NUMBERS"
+}
+
+# Echoes "<number> <head branch>" for each open PR based on the merged branch.
+list_child_prs() {
+    log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"'
 }
 
 # Args: head branch, base branch, PR number. git commands use the branch; gh
@@ -363,7 +369,7 @@ main() {
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue
             log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
-        done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
+        done < <(list_child_prs)
         # Deleting a PR's base branch closes the PR, so the retargets come first.
         log_cmd git push origin ":$MERGED_BRANCH"
         return 0
@@ -378,7 +384,7 @@ main() {
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue
             log_cmd gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
-        done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
+        done < <(list_child_prs)
         return 0
     fi
 
@@ -389,7 +395,7 @@ main() {
         [[ -n "$BRANCH" ]] || continue
         INITIAL_NUMBERS+=("$NUMBER")
         INITIAL_TARGETS+=("$BRANCH")
-    done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
+    done < <(list_child_prs)
 
     # Track successfully updated vs conflicted branches separately
     UPDATED_TARGETS=()
