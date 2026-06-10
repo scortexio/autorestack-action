@@ -40,9 +40,9 @@ format_state_marker() {
 }
 
 # Echoes the most recent state-marker line found in PR comments, or nothing.
-# Only comments posted with our own token count (viewerDidAuthor): anyone can
-# comment a marker, and acting on a forged one would merge and push an
-# attacker-chosen commit. A failed comments fetch aborts the run: treating it
+# Only comments posted under our own identity are trusted (viewerDidAuthor):
+# anyone can comment a marker, and acting on a forged one would merge and push
+# an attacker-chosen commit. A failed comments fetch aborts the run: treating it
 # as "no marker" would make the caller abandon the resume and drop the
 # conflict label for good.
 read_state_marker() {
