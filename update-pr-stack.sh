@@ -311,20 +311,22 @@ main() {
         fi
     done
 
-    # Only update base branches for successfully updated PRs
+    # Push the heads before retargeting: a failed push then leaves each PR
+    # intact on its old base, and the head already contains TARGET_BRANCH when
+    # the base flips to it.
+    if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
+        log_cmd git push origin "${UPDATED_TARGETS[@]}"
+    fi
+
     for BRANCH in "${UPDATED_TARGETS[@]}"; do
         log_cmd gh pr edit "$BRANCH" --base "$TARGET_BRANCH"
     done
 
-    # Push updated branches; only delete merged branch if no conflicts
+    # Deleting a PR's base branch closes the PR, so this must come after the
+    # retargets. Keep the branch for reference while conflicted PRs remain.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        # No conflicts - safe to delete merged branch
-        log_cmd git push origin ":$MERGED_BRANCH" "${UPDATED_TARGETS[@]}"
+        log_cmd git push origin ":$MERGED_BRANCH"
     else
-        # Some conflicts - keep merged branch for reference during manual resolution
-        if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
-            log_cmd git push origin "${UPDATED_TARGETS[@]}"
-        fi
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi
 }
