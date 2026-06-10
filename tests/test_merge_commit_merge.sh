@@ -50,6 +50,7 @@ FEATURE2_BEFORE=$(git rev-parse feature2)
 OUT=$(env \
     SQUASH_COMMIT="$MERGE_COMMIT" \
     MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
     GIT="$SCRIPT_DIR/mock_git.sh" \

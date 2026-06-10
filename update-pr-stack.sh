@@ -79,19 +79,48 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
-# Heuristic: the event payload does not say which merge method was used
-# (GitHub exposes it nowhere). A rebase merge copies every commit of the PR
-# onto the target branch, so each original has a patch-equivalent there and
-# git cherry marks it "-". A squash of two or more commits leaves only their
-# combined patch on the target, so the originals show as "+". A single-commit
-# PR merges identically under rebase and squash, so it takes the squash path.
-# A rebase whose copies drifted (context changes) reads as a squash, so the
-# heuristic errs toward processing, never toward skipping a real squash.
+# Args: a commit sha. Echoes the numbers of the pull requests that introduced
+# the commit to the repository, one per line.
+commit_pull_numbers() {
+    gh api "repos/{owner}/{repo}/commits/$1/pulls" --jq '.[].number' \
+        || { echo "❌ Could not list the pull requests that introduced commit $1" >&2; return 1; }
+}
+
+# Args: the merged PR's number. The event payload does not say which merge
+# method was used (GitHub records it nowhere), but GitHub associates every
+# trunk commit with the PR that introduced it. A squash introduces a single
+# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
+# none; a rebase introduces a copy of each PR commit, so with two or more
+# commits the one below SQUASH_COMMIT still belongs to this PR. A
+# single-commit PR merges identically under rebase and squash and correctly
+# reads as a squash here.
 is_rebase_merge() {
-    local COMMIT_COUNT
-    COMMIT_COUNT=$(git rev-list --count --no-merges "origin/$TARGET_BRANCH..origin/$MERGED_BRANCH")
-    [[ "$COMMIT_COUNT" -ge 2 ]] || return 1
-    ! git cherry "origin/$TARGET_BRANCH" "origin/$MERGED_BRANCH" | grep -q '^+'
+    local PR_NUMBER="$1"
+    local MERGE_SHA PARENT_SHA NUMBERS
+    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
+    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
+    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    if [[ -n "$NUMBERS" ]]; then
+        grep -qx "$PR_NUMBER" <<<"$NUMBERS"
+        return
+    fi
+    # The association is computed asynchronously, so right after the merge an
+    # empty answer is ambiguous: "no PR introduced this commit" (a squash on
+    # top of a direct push) or "not indexed yet" (a rebase copy). SQUASH_COMMIT
+    # itself always gets associated with this PR, and the commits of one merge
+    # are indexed together: once it shows up, an empty answer for the parent
+    # can be trusted.
+    for _ in $(seq 1 24); do
+        NUMBERS=$(commit_pull_numbers "$MERGE_SHA") || exit 1
+        if grep -qx "$PR_NUMBER" <<<"$NUMBERS"; then
+            NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+            grep -qx "$PR_NUMBER" <<<"$NUMBERS"
+            return
+        fi
+        sleep "${ASSOCIATION_POLL_SECONDS:-5}"
+    done
+    echo "❌ GitHub never associated $MERGE_SHA with PR #$PR_NUMBER; cannot tell a squash from a rebase" >&2
+    exit 1
 }
 
 # Args: head branch, base branch, PR number. git commands use the branch; gh
@@ -313,6 +342,7 @@ main() {
     check_env_var "SQUASH_COMMIT"
     check_env_var "MERGED_BRANCH"
     check_env_var "TARGET_BRANCH"
+    check_env_var "PR_NUMBER"
 
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
 
@@ -335,7 +365,7 @@ main() {
     # commits, so a child retargeted as-is would show its parent's changes in
     # its diff, and the squash sequence can raise spurious conflicts against
     # the intermediate copies. Tell the children and leave everything alone.
-    if is_rebase_merge; then
+    if is_rebase_merge "$PR_NUMBER"; then
         echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue

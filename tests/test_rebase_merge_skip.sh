@@ -2,9 +2,9 @@
 #
 # A PR merged with "Rebase and merge" is not supported: the commits on the
 # target are new copies, so neither retargeting children as-is nor the squash
-# sequence gives a correct result. The action must detect the rebase (every PR
-# commit has a patch-equivalent copy on the target), comment on the children,
-# and leave the stack alone.
+# sequence gives a correct result. The action must detect the rebase (the
+# commit below the merge sha was also introduced by this PR, per GitHub's
+# commit-PR association), comment on the children, and leave the stack alone.
 
 set -ueo pipefail
 
@@ -28,7 +28,7 @@ log_cmd git add file.txt
 log_cmd git commit -m "Initial commit"
 simulate_push main
 
-# feature1: two commits, so the rebase shape differs from a squash
+# feature1: two commits, so the rebase leaves a copy below the merge sha
 log_cmd git checkout -b feature1
 sed -i '2s/.*/Feature 1 change A/' file.txt
 log_cmd git add file.txt
@@ -59,7 +59,9 @@ FEATURE2_BEFORE=$(git rev-parse feature2)
 OUT=$(env \
     SQUASH_COMMIT="$MERGE_COMMIT" \
     MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
     TARGET_BRANCH=main \
+    MOCK_REBASE_COPIES="$(git rev-parse "$MERGE_COMMIT~")" \
     GH="$SCRIPT_DIR/mock_gh.sh" \
     GIT="$SCRIPT_DIR/mock_git.sh" \
     "$SCRIPT_DIR/../update-pr-stack.sh" 2>&1)
