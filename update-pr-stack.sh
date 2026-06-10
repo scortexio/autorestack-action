@@ -94,33 +94,41 @@ commit_pull_numbers() {
 # commits the one below SQUASH_COMMIT still belongs to this PR. A
 # single-commit PR merges identically under rebase and squash and correctly
 # reads as a squash here.
-is_rebase_merge() {
-    local PR_NUMBER="$1"
-    local MERGE_SHA PARENT_SHA NUMBERS
-    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
-    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
-    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
-    if [[ -n "$NUMBERS" ]]; then
-        grep -qx "$PR_NUMBER" <<<"$NUMBERS"
-        return
-    fi
-    # The association is computed asynchronously, so right after the merge an
-    # empty answer is ambiguous: "no PR introduced this commit" (a squash on
-    # top of a direct push) or "not indexed yet" (a rebase copy). SQUASH_COMMIT
-    # itself always gets associated with this PR, and the commits of one merge
-    # are indexed together: once it shows up, an empty answer for the parent
-    # can be trusted.
+# Args: the merge commit sha, the merged PR's number. The association is
+# computed asynchronously, some time after the merge. The merge commit always
+# belongs to the merged PR, so once it shows up the index has caught up with
+# this merge; until then, an empty answer for any commit of the merge means
+# nothing. Exits if the association never appears.
+wait_for_pull_association() {
+    local MERGE_SHA="$1" PR_NUMBER="$2"
+    local NUMBERS
     for _ in $(seq 1 24); do
         NUMBERS=$(commit_pull_numbers "$MERGE_SHA") || exit 1
         if grep -qx "$PR_NUMBER" <<<"$NUMBERS"; then
-            NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
-            grep -qx "$PR_NUMBER" <<<"$NUMBERS"
-            return
+            return 0
         fi
         sleep "${ASSOCIATION_POLL_SECONDS:-5}"
     done
     echo "❌ GitHub never associated $MERGE_SHA with PR #$PR_NUMBER; cannot tell a squash from a rebase" >&2
     exit 1
+}
+
+is_rebase_merge() {
+    local PR_NUMBER="$1"
+    local MERGE_SHA PARENT_SHA NUMBERS
+    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
+    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
+
+    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    if [[ -z "$NUMBERS" ]]; then
+        # Ambiguous: "no PR introduced this commit" (a squash on top of a
+        # direct push) and "not indexed yet" (a rebase copy) both come back
+        # empty. Wait until the index has caught up with this merge, then ask
+        # again; this time empty really means no PR.
+        wait_for_pull_association "$MERGE_SHA" "$PR_NUMBER"
+        NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    fi
+    grep -qx "$PR_NUMBER" <<<"$NUMBERS"
 }
 
 # Args: head branch, base branch, PR number. git commands use the branch; gh
