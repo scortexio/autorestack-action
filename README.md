@@ -124,7 +124,7 @@ jobs:
 
 ### Notes
 
-* Currently only supports squash merges; PRs merged with a merge commit are detected and skipped (history isn't rewritten, so stacked PRs stay valid as-is)
+* Built for squash merges. A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch. Rebase merges look like squash merges in the event payload and take the squash path; the result is correct, but a multi-commit rebase can require a manual conflict resolution that a squash would not have.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
 

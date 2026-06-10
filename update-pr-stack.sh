@@ -301,9 +301,18 @@ main() {
 
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
 
-    # A merge-commit merge does not rewrite history; stacked PRs stay valid.
+    # A merge-commit merge does not rewrite history: each child's head already
+    # contains the merged branch's commits, and the merge commit carries them
+    # into TARGET_BRANCH. The heads need no synthetic merge; just retarget the
+    # children and delete the merged branch.
     if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
-        echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; nothing to do"
+        echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; retargeting children without touching their heads"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
+        done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
+        # Deleting a PR's base branch closes the PR, so the retargets come first.
+        log_cmd git push origin ":$MERGED_BRANCH"
         return 0
     fi
 
