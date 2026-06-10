@@ -23,6 +23,9 @@ if [[ "$1" == "pr" && "$2" == "list" ]]; then
 elif [[ "$1" == "pr" && "$2" == "edit" ]]; then
     # Just log the edit command
     echo "Mock: gh pr edit $3 --base $5"
+elif [[ "$1" == "pr" && "$2" == "comment" ]]; then
+    # Just log the comment command
+    echo "Mock: gh pr comment $3"
 else
     echo "Unknown gh command: $@" >&2
     exit 1

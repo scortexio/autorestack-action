@@ -79,6 +79,21 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
+# Heuristic: the event payload does not say which merge method was used
+# (GitHub exposes it nowhere). A rebase merge copies every commit of the PR
+# onto the target branch, so each original has a patch-equivalent there and
+# git cherry marks it "-". A squash of two or more commits leaves only their
+# combined patch on the target, so the originals show as "+". A single-commit
+# PR merges identically under rebase and squash, so it takes the squash path.
+# A rebase whose copies drifted (context changes) reads as a squash, so the
+# heuristic errs toward processing, never toward skipping a real squash.
+is_rebase_merge() {
+    local COMMIT_COUNT
+    COMMIT_COUNT=$(git rev-list --count --no-merges "origin/$TARGET_BRANCH..origin/$MERGED_BRANCH")
+    [[ "$COMMIT_COUNT" -ge 2 ]] || return 1
+    ! git cherry "origin/$TARGET_BRANCH" "origin/$MERGED_BRANCH" | grep -q '^+'
+}
+
 # Args: head branch, base branch, PR number. git commands use the branch; gh
 # commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
@@ -313,6 +328,19 @@ main() {
         done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
         # Deleting a PR's base branch closes the PR, so the retargets come first.
         log_cmd git push origin ":$MERGED_BRANCH"
+        return 0
+    fi
+
+    # Rebase merges are not supported: the copies on the target are new
+    # commits, so a child retargeted as-is would show its parent's changes in
+    # its diff, and the squash sequence can raise spurious conflicts against
+    # the intermediate copies. Tell the children and leave everything alone.
+    if is_rebase_merge; then
+        echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
+        done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
         return 0
     fi
 

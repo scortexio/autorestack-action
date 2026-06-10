@@ -18,6 +18,7 @@ jobs:
           bash tests/test_mixed_workflows.sh
           bash tests/test_conflict_resolution_resume.sh
           bash tests/test_merge_commit_merge.sh
+          bash tests/test_rebase_merge_skip.sh
 
   e2e-tests:
     name: E2E Tests
