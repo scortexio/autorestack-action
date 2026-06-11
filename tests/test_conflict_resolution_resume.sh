@@ -22,6 +22,7 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 # $CALLS and is driven by env vars set per scenario:
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
 #   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
+#   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
 # The PR's base branch is not mocked: the script must take it from PR_BASE
 # (event payload), so a baseRefName query is an unhandled call and fails.
 make_mock_gh() {
@@ -32,7 +33,9 @@ set -ueo pipefail
 echo "gh $*" >> "$CALLS"
 if [[ "$1 $2" == "pr view" ]]; then
     case "$*" in
-        *--json\ labels*)   printf '%s\n' "${MOCK_LABELS:-}";;
+        *--json\ labels*)
+            [[ "${MOCK_LABELS_FAIL:-}" == 1 ]] && { echo "mock gh: labels API down" >&2; exit 1; }
+            printf '%s\n' "${MOCK_LABELS:-}";;
         *--json\ comments*)
             # The comments file stands for our own comments only, so the query
             # must restrict itself to those.
@@ -94,7 +97,7 @@ setup_repo() {
 run_resume() {
     env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
-        MOCK_LABELS="$MOCK_LABELS" \
+        MOCK_LABELS="$MOCK_LABELS" MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
         bash "$ROOT_DIR/update-pr-stack.sh" >"$WORK/out.log" 2>&1 || echo "EXIT=$?" >>"$WORK/out.log"
 }
@@ -216,6 +219,40 @@ grep -q "gh pr comment" "$CALLS" || fail "F: no explanatory comment posted"
 grep -q -- "--base" "$CALLS" && fail "F: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "F: child was pushed"
 ok "F: missing base branch detected, no crash, label removed"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario G: reading the PR comments fails -> fail the run, keep the label"
+setup_repo
+# An API failure must not pass for "no state marker": that path removes the
+# conflict label and permanently cancels the auto-resume. Fail loudly instead,
+# so the label stays on and the next push retries.
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/does-not-exist"   # makes the mock gh fail on pr view --json comments
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "G: run should have failed"
+grep -q "remove-label" "$CALLS" && fail "G: label must NOT be removed on an API failure"
+grep -q "gh pr comment" "$CALLS" && fail "G: no comment must be posted on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "G: child was pushed"
+ok "G: comments API failure fails the run and keeps the resume armed"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario H: reading the labels fails -> fail the run, do nothing"
+setup_repo
+# An API failure must not pass for "no conflict label": that ends the run
+# green without resuming anything.
+MOCK_LABELS=""
+MOCK_LABELS_FAIL=1
+PR_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed, not ended green"
+grep -q "remove-label" "$CALLS" && fail "H: label must NOT be touched on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "H: child was pushed"
+ok "H: labels API failure fails the run instead of skipping the resume"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"
