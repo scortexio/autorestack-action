@@ -235,8 +235,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     return 0
 }
 
-# Check if a PR has the conflict resolution label. A failed labels fetch aborts
-# the run rather than reading as "no label", which would silently skip a resume.
+# Check if a PR has the conflict resolution label.
 pr_has_conflict_label() {
     local PR_NUMBER="$1"
     local LABELS
