@@ -41,8 +41,6 @@ format_state_marker() {
 }
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
-# A failed comments fetch aborts the run: treating it as "no marker" would make
-# the caller abandon the resume and drop the conflict label for good.
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
