@@ -85,6 +85,7 @@ run_update_pr_stack() {
     env \
     SQUASH_COMMIT=$SQUASH_COMMIT \
     MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
     GIT="$SCRIPT_DIR/mock_git.sh" \
