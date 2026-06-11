@@ -9,6 +9,13 @@ permissions:
   contents: write
   pull-requests: write
 
+# Serialize runs per PR: the push that finishes a conflict resolution fires a
+# synchronize event while the conflict label is still attached, so without a
+# group the follow-up run races the one that triggered it.
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
