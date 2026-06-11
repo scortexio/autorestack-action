@@ -558,7 +558,7 @@ wait_for_synchronize_workflow() {
                 log_cmd gh run view "$target_run_id" --repo "$REPO_FULL_NAME" --log || echo >&2 "Could not fetch logs for run $target_run_id"
                 return 1
             fi
-        elif [[ "$run_status" == "queued" || "$run_status" == "in_progress" || "$run_status" == "waiting" ]]; then
+        elif [[ "$run_status" == "queued" || "$run_status" == "in_progress" || "$run_status" == "waiting" || "$run_status" == "pending" ]]; then
             echo >&2 "Workflow $target_run_id is $run_status. Sleeping $sleep_time seconds."
         else
             echo >&2 "Workflow $target_run_id has unexpected status: $run_status. Conclusion: $run_conclusion"
@@ -665,7 +665,7 @@ wait_for_workflow() {
                 log_cmd gh run view "$target_run_id" --repo "$REPO_FULL_NAME" --log || echo >&2 "Could not fetch logs for run $target_run_id"
                 return 1
             fi
-        elif [[ "$run_status" == "queued" || "$run_status" == "in_progress" || "$run_status" == "waiting" ]]; then
+        elif [[ "$run_status" == "queued" || "$run_status" == "in_progress" || "$run_status" == "waiting" || "$run_status" == "pending" ]]; then
             echo >&2 "Workflow $target_run_id is $run_status. Sleeping $sleep_time seconds."
         else
             echo >&2 "Workflow $target_run_id has unexpected status: $run_status. Conclusion: $run_conclusion"
