@@ -6,6 +6,7 @@
 # SQUASH_COMMIT - The hash of the squash commit that was merged
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
 # TARGET_BRANCH - The name of the branch that the PR was merged into
+# PR_NUMBER - The number of the PR that was merged
 #
 # Required environment variables (conflict-resolved mode):
 # PR_BRANCH - The head branch of the PR being resumed
@@ -82,6 +83,63 @@ has_squash_commit() {
     local BASE="$2"
     git merge-base --is-ancestor "$BASE" "$BRANCH" \
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
+}
+
+# Args: a commit sha. Echoes the numbers of the pull requests that introduced
+# the commit to the repository, one per line.
+commit_pull_numbers() {
+    gh api "repos/{owner}/{repo}/commits/$1/pulls" --jq '.[].number' \
+        || { echo "❌ Could not list the pull requests that introduced commit $1" >&2; return 1; }
+}
+
+# Args: the merge commit sha, the merged PR's number. The association is
+# computed asynchronously, some time after the merge. The merge commit always
+# belongs to the merged PR, so once it shows up the index has caught up with
+# this merge; until then, an empty answer for any commit of the merge means
+# nothing. Exits if the association never appears.
+wait_for_pull_association() {
+    local MERGE_SHA="$1" PR_NUMBER="$2"
+    local NUMBERS
+    for _ in $(seq 1 24); do
+        NUMBERS=$(commit_pull_numbers "$MERGE_SHA") || exit 1
+        if grep -qx "$PR_NUMBER" <<<"$NUMBERS"; then
+            return 0
+        fi
+        sleep "${ASSOCIATION_POLL_SECONDS:-5}"
+    done
+    echo "❌ GitHub never associated $MERGE_SHA with PR #$PR_NUMBER; cannot tell a squash from a rebase" >&2
+    exit 1
+}
+
+# Args: the merged PR's number. The event payload does not say which merge
+# method was used (GitHub records it nowhere), but GitHub associates every
+# trunk commit with the PR that introduced it. A squash introduces a single
+# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
+# none; a rebase introduces a copy of each PR commit, so with two or more
+# commits the one below SQUASH_COMMIT still belongs to this PR. A
+# single-commit PR merges identically under rebase and squash and correctly
+# reads as a squash here.
+is_rebase_merge() {
+    local PR_NUMBER="$1"
+    local MERGE_SHA PARENT_SHA NUMBERS
+    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
+    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
+
+    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    if [[ -z "$NUMBERS" ]]; then
+        # Ambiguous: "no PR introduced this commit" (a squash on top of a
+        # direct push) and "not indexed yet" (a rebase copy) both come back
+        # empty. Wait until the index has caught up with this merge, then ask
+        # again; this time empty really means no PR.
+        wait_for_pull_association "$MERGE_SHA" "$PR_NUMBER"
+        NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    fi
+    grep -qx "$PR_NUMBER" <<<"$NUMBERS"
+}
+
+# Echoes "<number> <head branch>" for each open PR based on the merged branch.
+list_child_prs() {
+    log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"'
 }
 
 # Args: head branch, base branch, PR number. git commands use the branch; gh
@@ -178,8 +236,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     return 0
 }
 
-# Check if a PR has the conflict resolution label. A failed labels fetch aborts
-# the run rather than reading as "no label", which would silently skip a resume.
+# Check if a PR has the conflict resolution label.
 pr_has_conflict_label() {
     local PR_NUMBER="$1"
     local LABELS
@@ -313,8 +370,37 @@ main() {
     check_env_var "SQUASH_COMMIT"
     check_env_var "MERGED_BRANCH"
     check_env_var "TARGET_BRANCH"
+    check_env_var "PR_NUMBER"
 
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
+
+    # A merge-commit merge does not rewrite history: each child's head already
+    # contains the merged branch's commits, and the merge commit carries them
+    # into TARGET_BRANCH. The heads need no synthetic merge; just retarget the
+    # children and delete the merged branch.
+    if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
+        echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; retargeting children without touching their heads"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
+        done < <(list_child_prs)
+        # Deleting a PR's base branch closes the PR, so the retargets come first.
+        log_cmd git push origin ":$MERGED_BRANCH"
+        return 0
+    fi
+
+    # Rebase merges are not supported: the copies on the target are new
+    # commits, so a child retargeted as-is would show its parent's changes in
+    # its diff, and the squash sequence can raise spurious conflicts against
+    # the intermediate copies. Tell the children and leave everything alone.
+    if is_rebase_merge "$PR_NUMBER"; then
+        echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
+        done < <(list_child_prs)
+        return 0
+    fi
 
     # Find all PRs directly targeting the merged PR's head
     INITIAL_NUMBERS=()
@@ -323,7 +409,7 @@ main() {
         [[ -n "$BRANCH" ]] || continue
         INITIAL_NUMBERS+=("$NUMBER")
         INITIAL_TARGETS+=("$BRANCH")
-    done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
+    done < <(list_child_prs)
 
     # Track successfully updated vs conflicted branches separately
     UPDATED_TARGETS=()
