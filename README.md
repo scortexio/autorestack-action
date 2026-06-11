@@ -80,6 +80,10 @@ on:
   pull_request:
     types: [closed, synchronize]
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -111,6 +115,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -124,7 +132,7 @@ jobs:
 
 ### Notes
 
-* Currently only supports squash merges
+* Built for squash merges. A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch. Rebase merges are not supported: the action detects them through GitHub's commit-PR association (the merge method itself is recorded nowhere) and comments on each child PR instead of acting.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
 
