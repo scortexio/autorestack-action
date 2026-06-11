@@ -2,10 +2,15 @@
 #
 # Updates PR stack after merging a PR
 #
-# Required environment variables:
+# Required environment variables (squash-merge mode):
 # SQUASH_COMMIT - The hash of the squash commit that was merged
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
 # TARGET_BRANCH - The name of the branch that the PR was merged into
+#
+# Required environment variables (conflict-resolved mode):
+# PR_BRANCH - The head branch of the PR being resumed
+# PR_NUMBER - Its PR number, from the event payload
+# PR_BASE   - Its base branch, from the event payload
 #
 # Design note:
 # This script aims to output a transcript of "plain" git/gh commands that a
@@ -36,8 +41,8 @@ format_state_marker() {
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
 read_state_marker() {
-    local PR_BRANCH="$1"
-    gh pr view "$PR_BRANCH" --json comments --jq '.comments[].body' 2>/dev/null \
+    local PR_NUMBER="$1"
+    gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' 2>/dev/null \
         | { grep -F "$STATE_MARKER_PREFIX" || true; } | tail -n1
 }
 
@@ -74,9 +79,12 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
+# Args: head branch, base branch, PR number. git commands use the branch; gh
+# commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
     local BRANCH="$1"
     local BASE_BRANCH="$2"
+    local PR_NUMBER="$3"
 
     # Checkout first to ensure the local branch exists (created from origin if
     # needed). This allows has_squash_commit to compare local refs, which matters
@@ -144,10 +152,10 @@ update_direct_target() {
             echo "Once you push, this action will resume and finish updating this pull request."
             echo
             format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
-        } | log_cmd gh pr comment "$BRANCH" -F -
+        } | log_cmd gh pr comment "$PR_NUMBER" -F -
         # Create the label if it doesn't exist, then add it to the PR
         gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
-        log_cmd gh pr edit "$BRANCH" --add-label "$CONFLICT_LABEL"
+        log_cmd gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
         return 1
     else
         log_cmd git merge --no-edit -s ours SQUASH_COMMIT
@@ -167,9 +175,9 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
 # Check if a PR has the conflict resolution label
 pr_has_conflict_label() {
-    local BRANCH="$1"
+    local PR_NUMBER="$1"
     local LABELS
-    LABELS=$(gh pr view "$BRANCH" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+    LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
     echo "$LABELS" | grep -q "^${CONFLICT_LABEL}$"
 }
 
@@ -196,20 +204,22 @@ has_sibling_conflicts() {
 # the conflict label so this action stops re-triggering. Used for the dead-end
 # cases where we cannot or must not finish automatically.
 abandon_resume() {
-    local PR_BRANCH="$1"
+    local PR_NUMBER="$1"
     local MESSAGE="$2"
-    echo "$MESSAGE" | log_cmd gh pr comment "$PR_BRANCH" -F -
-    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+    echo "$MESSAGE" | log_cmd gh pr comment "$PR_NUMBER" -F -
+    log_cmd gh pr edit "$PR_NUMBER" --remove-label "$CONFLICT_LABEL"
 }
 
 # Continue processing after user manually resolved conflicts
 continue_after_resolution() {
     check_env_var "PR_BRANCH"
+    check_env_var "PR_NUMBER"
+    check_env_var "PR_BASE"
 
-    echo "Checking if $PR_BRANCH needs continuation after conflict resolution..."
+    echo "Checking if PR #$PR_NUMBER ($PR_BRANCH) needs continuation after conflict resolution..."
 
     # Check if the PR has the conflict label
-    if ! pr_has_conflict_label "$PR_BRANCH"; then
+    if ! pr_has_conflict_label "$PR_NUMBER"; then
         echo "✓ $PR_BRANCH does not have conflict label; nothing to do"
         return
     fi
@@ -221,10 +231,10 @@ continue_after_resolution() {
     # Recover them from the marker the squash-merge run left in the conflict
     # comment.
     local MARKER
-    MARKER=$(read_state_marker "$PR_BRANCH")
+    MARKER=$(read_state_marker "$PR_NUMBER")
     if [[ -z "$MARKER" ]]; then
         echo "⚠️ No autorestack state marker on $PR_BRANCH; cannot resume safely. Removing the label."
-        abandon_resume "$PR_BRANCH" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
+        abandon_resume "$PR_NUMBER" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
         return
     fi
 
@@ -232,17 +242,12 @@ continue_after_resolution() {
     read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
     echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
 
-    # The base we left the PR on while waiting for conflict resolution was the
-    # merged parent branch. If it no longer matches, a human retargeted the PR
-    # (e.g. straight onto the integration branch); we are no longer the authority
-    # on its base, so we step back without touching the branch. This runs before
-    # any mutation: once the base diverges, the recorded target is stale and a
-    # merge built against it would be wrong.
-    local CURRENT_BASE
-    CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
-    if [[ "$CURRENT_BASE" != "$OLD_BASE" ]]; then
-        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $CURRENT_BASE); not updating the stack."
-        abandon_resume "$PR_BRANCH" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
+    # The PR was left based on the merged parent branch. If the payload shows a
+    # different base, a human retargeted the PR; the recorded target is stale,
+    # so step back before any mutation.
+    if [[ "$PR_BASE" != "$OLD_BASE" ]]; then
+        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $PR_BASE); not updating the stack."
+        abandon_resume "$PR_NUMBER" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
         return
     fi
 
@@ -252,7 +257,7 @@ continue_after_resolution() {
     # can succeed, so give up cleanly rather than stranding the PR under the label.
     if ! git rev-parse --verify --quiet "origin/$NEW_TARGET" >/dev/null; then
         echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; abandoning resume of $PR_BRANCH."
-        abandon_resume "$PR_BRANCH" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
+        abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
         return
     fi
 
@@ -265,7 +270,7 @@ continue_after_resolution() {
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     MERGED_BRANCH="$OLD_BASE"
     TARGET_BRANCH="$NEW_TARGET"
-    if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
+    if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET" "$PR_NUMBER"; then
         echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
         return 1
     fi
@@ -276,8 +281,8 @@ continue_after_resolution() {
     # NEW_TARGET when the base flips to it, keeping the PR mergeable (GitHub
     # suppresses CI on a PR that conflicts with its base).
     log_cmd git push origin "$PR_BRANCH"
-    log_cmd gh pr edit "$PR_BRANCH" --base "$NEW_TARGET"
-    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+    log_cmd gh pr edit "$PR_NUMBER" --base "$NEW_TARGET"
+    log_cmd gh pr edit "$PR_NUMBER" --remove-label "$CONFLICT_LABEL"
 
     # Check if old base branch should be deleted
     if has_sibling_conflicts "$OLD_BASE" "$PR_BRANCH"; then
@@ -297,17 +302,25 @@ main() {
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
 
     # Find all PRs directly targeting the merged PR's head
-    INITIAL_TARGETS=($(log_cmd gh pr list --base "$MERGED_BRANCH" --json headRefName --jq '.[].headRefName'))
+    INITIAL_NUMBERS=()
+    INITIAL_TARGETS=()
+    while read -r NUMBER BRANCH; do
+        [[ -n "$BRANCH" ]] || continue
+        INITIAL_NUMBERS+=("$NUMBER")
+        INITIAL_TARGETS+=("$BRANCH")
+    done < <(log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"')
 
     # Track successfully updated vs conflicted branches separately
     UPDATED_TARGETS=()
+    UPDATED_NUMBERS=()
     CONFLICTED_TARGETS=()
 
-    for BRANCH in "${INITIAL_TARGETS[@]}"; do
-        if update_direct_target "$BRANCH" "$TARGET_BRANCH"; then
-            UPDATED_TARGETS+=("$BRANCH")
+    for i in "${!INITIAL_TARGETS[@]}"; do
+        if update_direct_target "${INITIAL_TARGETS[$i]}" "$TARGET_BRANCH" "${INITIAL_NUMBERS[$i]}"; then
+            UPDATED_TARGETS+=("${INITIAL_TARGETS[$i]}")
+            UPDATED_NUMBERS+=("${INITIAL_NUMBERS[$i]}")
         else
-            CONFLICTED_TARGETS+=("$BRANCH")
+            CONFLICTED_TARGETS+=("${INITIAL_TARGETS[$i]}")
         fi
     done
 
@@ -318,8 +331,8 @@ main() {
         log_cmd git push origin "${UPDATED_TARGETS[@]}"
     fi
 
-    for BRANCH in "${UPDATED_TARGETS[@]}"; do
-        log_cmd gh pr edit "$BRANCH" --base "$TARGET_BRANCH"
+    for NUMBER in "${UPDATED_NUMBERS[@]}"; do
+        log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
     done
 
     # Deleting a PR's base branch closes the PR, so this must come after the
