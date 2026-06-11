@@ -172,7 +172,7 @@ grep -q -- "--base" "$CALLS" && fail "D: base must NOT be edited"
 ok "D: missing target detected, no branch mutation, label removed"
 
 # ---------------------------------------------------------------------------
-echo "### Scenario E: malformed state marker -> no mutation"
+echo "### Scenario E: malformed state marker -> internal error, die without touching the PR"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
 PR_BASE="parent"
@@ -180,11 +180,12 @@ MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; echo '<!-- autorestack-state: base=parent target=main -->'; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
-grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "E: label not removed"
-grep -q "gh pr comment" "$CALLS" || fail "E: no explanatory comment posted"
+grep -q "EXIT=1" "$WORK/out.log" || fail "E: run must die on a malformed marker"
+grep -q "remove-label" "$CALLS" && fail "E: label must stay on"
+grep -q "gh pr comment" "$CALLS" && fail "E: no PR comment for an internal error"
 grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
-ok "E: malformed marker handled, no branch mutation, label removed"
+ok "E: malformed marker dies, PR untouched, label kept"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"

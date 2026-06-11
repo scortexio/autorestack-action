@@ -309,9 +309,8 @@ continue_after_resolution() {
     echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
 
     if [[ -z "$OLD_BASE" || -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
-        echo "⚠️ State marker on $PR_BRANCH is malformed; cannot resume safely. Removing the label."
-        abandon_resume "$PR_NUMBER" "ℹ️ autorestack found a malformed state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
-        return
+        echo "Error: malformed state marker on $PR_BRANCH: $MARKER" >&2
+        exit 1
     fi
 
     # The PR was left based on the merged parent branch. If the payload shows a
