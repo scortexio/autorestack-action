@@ -13,6 +13,7 @@ jobs:
 
       - name: Run unit tests
         run: |
+          bash tests/test_command_utils.sh
           bash tests/test_update_pr_stack.sh
           bash tests/test_rebase_workflow.sh
           bash tests/test_mixed_workflows.sh
