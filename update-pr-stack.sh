@@ -39,7 +39,7 @@ format_state_marker() {
         "$STATE_MARKER_PREFIX" "$1" "$2" "$3"
 }
 
-# Echoes the most recent state-marker line found in PR comments, or nothing.
+# Echoes the most recent state-marker line found in our PR comments, or nothing.
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
