@@ -21,7 +21,7 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 # Build a configurable gh mock in a temp dir. It records every invocation to
 # $CALLS and is driven by env vars set per scenario:
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
-#   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
+#   MOCK_COMMENTS_FILE  file served as the body of our own PR comments
 # The PR's base branch is not mocked: the script must take it from PR_BASE
 # (event payload), so a baseRefName query is an unhandled call and fails.
 make_mock_gh() {
@@ -33,18 +33,18 @@ echo "gh $*" >> "$CALLS"
 if [[ "$1 $2" == "pr view" ]]; then
     case "$*" in
         *--json\ labels*)   printf '%s\n' "${MOCK_LABELS:-}";;
-        *--json\ comments*)
-            # The comments file stands for our own comments only, so the query
-            # must restrict itself to those.
-            [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
-            cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
+elif [[ "$1 $2" == "api graphql" ]]; then
+    # The comments file stands for our own comments only, so the query must
+    # restrict itself to those.
+    [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
+    cat "${MOCK_COMMENTS_FILE:-/dev/null}"
 elif [[ "$1 $2" == "pr comment" ]]; then
     cat >/dev/null  # consume the -F - body
 elif [[ "$1 $2" == "pr edit" ]]; then
     :
-elif [[ "$1 $2" == "pr list" ]]; then
+elif [[ "$1" == "api" ]]; then
     :  # no sibling conflicts
 elif [[ "$1 $2" == "label create" ]]; then
     :
@@ -93,6 +93,7 @@ setup_repo() {
 
 run_resume() {
     env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
+        GITHUB_REPOSITORY=tester/repo \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
         MOCK_LABELS="$MOCK_LABELS" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
