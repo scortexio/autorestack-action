@@ -4,6 +4,10 @@
 # Only direct children are queried now (no recursive updates of indirect children).
 
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
+    if [[ "${MOCK_PR_LIST_FAIL:-}" == 1 ]]; then
+        echo "mock gh: pr list API down" >&2
+        exit 1
+    fi
     # Parse the --base argument to determine which PRs to return
     base=""
     for ((i=1; i<=$#; i++)); do
