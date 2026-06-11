@@ -19,8 +19,9 @@ This action tries to fix that in a transparent way. Install it, and hopefully th
 1. Triggers when a PR is squash merged
 2. Finds PRs that were based on the merged branch (direct children only)
 3. Creates a synthetic merge commit with three parents (child tip, deleted branch tip, squash commit) to preserve history without re-introducing code
-4. Updates the direct child PRs to base on trunk now that the bottom change has landed
-5. Pushes updated branches and deletes the merged branch
+4. Pushes the updated branches
+5. Updates the direct child PRs to base on trunk now that the bottom change has landed
+6. Deletes the merged branch
 
 **Note:** Indirect descendants (grandchildren, etc.) are intentionally not modified. Their PR diffs remain correct because the merge-base calculation still works—the synthetic merge commit includes the original parent commit as an ancestor. When their direct parent is eventually merged, they become direct children and get updated at that point.
 
@@ -79,6 +80,10 @@ on:
   pull_request:
     types: [closed, synchronize]
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -110,6 +115,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -123,9 +132,10 @@ jobs:
 
 ### Notes
 
-* Currently only supports squash merges
+* Built for squash merges. A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch. Rebase merges are not supported: the action detects them through GitHub's commit-PR association (the merge method itself is recorded nowhere) and comments on each child PR instead of acting.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
+* After retargeting, GitHub sometimes keeps rendering a PR's diff against its old, deleted base, so the PR appears to contain already-merged changes. The branch itself is correct (`git diff <base>...HEAD` shows the real diff). Pushing any commit to the PR usually makes GitHub recompute. Sometimes it doesn't. Tough luck.
 
 ---
 

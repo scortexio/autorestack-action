@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -eo pipefail
 
 # Get script directory (needed for static mock files)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,17 +71,34 @@ echo "Simulated Squash commit (via cherry-pick): $SQUASH_COMMIT"
 
 echo "Running update-pr-stack.sh..."
 # The update script sources command_utils.sh itself
+# Capture stdout+stderr interleaved so command ordering can be asserted.
+RUN_LOG="$TEST_REPO/update_run.log"
 run_update_pr_stack() {
   log_cmd \
     env \
     SQUASH_COMMIT=$SQUASH_COMMIT \
     MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
     GIT="$SCRIPT_DIR/mock_git.sh" \
-    $SCRIPT_DIR/../update-pr-stack.sh
+    $SCRIPT_DIR/../update-pr-stack.sh 2>&1 | tee "$RUN_LOG"
 }
 run_update_pr_stack
+
+# The head must be pushed before the PR is retargeted (a failed push must leave
+# the PR untouched on its old base), and the merged branch deleted only after
+# the retarget (deleting a PR's base branch closes the PR).
+push_line=$(grep -n "git push origin feature2" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
+edit_line=$(grep -n "pr edit 2 --base main" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
+delete_line=$(grep -n "git push origin :feature1" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
+if [[ -n "$push_line" && -n "$edit_line" && -n "$delete_line" \
+      && "$push_line" -lt "$edit_line" && "$edit_line" -lt "$delete_line" ]]; then
+    echo "✅ Ordering: push head, then retarget base, then delete merged branch"
+else
+    echo "❌ Wrong ordering (push=$push_line edit=$edit_line delete=$delete_line)"
+    exit 1
+fi
 
 # Verify the results
 cd "$TEST_REPO"
@@ -190,6 +207,31 @@ else
     log_cmd git log --graph --oneline --all
     exit 1
 fi
+
+# A failed children listing must fail the run before any mutation: silently
+# treating it as "no children" would delete the merged branch under the
+# children it never saw.
+echo -e "\nRunning update script with a failing pr list..."
+FAIL_LOG="$TEST_REPO/update_fail_run.log"
+if log_cmd env \
+    SQUASH_COMMIT=$SQUASH_COMMIT \
+    MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
+    TARGET_BRANCH=main \
+    MOCK_PR_LIST_FAIL=1 \
+    GH="$SCRIPT_DIR/mock_gh.sh" \
+    GIT="$SCRIPT_DIR/mock_git.sh" \
+    $SCRIPT_DIR/../update-pr-stack.sh > "$FAIL_LOG" 2>&1; then
+    echo "❌ run must fail when the children cannot be listed"
+    cat "$FAIL_LOG"
+    exit 1
+fi
+if grep -q "git push origin :feature1" "$FAIL_LOG"; then
+    echo "❌ merged branch must not be deleted when the children cannot be listed"
+    cat "$FAIL_LOG"
+    exit 1
+fi
+echo "✅ Failing pr list fails the run without deleting the merged branch"
 
 echo -e "\nAll tests passed! 🎉"
 

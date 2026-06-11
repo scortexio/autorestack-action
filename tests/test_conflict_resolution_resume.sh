@@ -21,10 +21,11 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 # Build a configurable gh mock in a temp dir. It records every invocation to
 # $CALLS and is driven by env vars set per scenario:
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
-#   MOCK_BASE           base branch returned by `pr view --json baseRefName`
 #   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
 #   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
 #   MOCK_PR_LIST_FAIL   set to 1 to make `pr list` fail
+# The PR's base branch is not mocked: the script must take it from PR_BASE
+# (event payload), so a baseRefName query is an unhandled call and fails.
 make_mock_gh() {
     local dir="$1"
     cat > "$dir/mock_gh.sh" <<'EOF'
@@ -36,8 +37,11 @@ if [[ "$1 $2" == "pr view" ]]; then
         *--json\ labels*)
             [[ "${MOCK_LABELS_FAIL:-}" == 1 ]] && { echo "mock gh: labels API down" >&2; exit 1; }
             printf '%s\n' "${MOCK_LABELS:-}";;
-        *--json\ baseRefName*) printf '%s\n' "${MOCK_BASE:-}";;
-        *--json\ comments*) cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
+        *--json\ comments*)
+            # The comments file stands for our own comments only, so the query
+            # must restrict itself to those.
+            [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
+            cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
 elif [[ "$1 $2" == "pr comment" ]]; then
@@ -93,11 +97,11 @@ setup_repo() {
 }
 
 run_resume() {
-    env ACTION_MODE=conflict-resolved PR_BRANCH=child \
+    env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
-        MOCK_LABELS="$MOCK_LABELS" MOCK_BASE="$MOCK_BASE" \
+        MOCK_LABELS="$MOCK_LABELS" MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
-        MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" MOCK_PR_LIST_FAIL="${MOCK_PR_LIST_FAIL:-}" \
+        MOCK_PR_LIST_FAIL="${MOCK_PR_LIST_FAIL:-}" \
         bash "$ROOT_DIR/update-pr-stack.sh" >"$WORK/out.log" 2>&1 || echo "EXIT=$?" >>"$WORK/out.log"
 }
 
@@ -109,7 +113,7 @@ marker() { # base target squash
 echo "### Scenario A: user manually retargeted the base -> no mutation"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="spark"   # human changed it; marker says parent
+PR_BASE="spark"   # human changed it; marker says parent
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
@@ -125,7 +129,7 @@ ok "A: manual retarget detected, no branch mutation, label removed"
 echo "### Scenario B: no state marker -> no mutation"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"
+PR_BASE="parent"
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### some old conflict comment with no marker"; } > "$MOCK_COMMENTS_FILE"
 run_resume
@@ -143,13 +147,13 @@ setup_repo
 git -C "$WORK" merge -q --no-edit main
 git -C "$WORK" push -q origin child
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"   # matches marker -> not a manual retarget
+PR_BASE="parent"   # matches marker -> not a manual retarget
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
 grep -q -- "git push origin child" "$CALLS" || fail "C: child not pushed"
-grep -q -- "pr edit child --base main" "$CALLS" || fail "C: base not retargeted to main"
+grep -q -- "pr edit 5 --base main" "$CALLS" || fail "C: base not retargeted to main"
 grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "C: label not removed"
 push_line=$(grep -n -- "git push origin child" "$CALLS" | head -1 | cut -d: -f1)
 base_line=$(grep -n -- "--base main" "$CALLS" | head -1 | cut -d: -f1)
@@ -162,7 +166,7 @@ ok "C: resume pushes, retargets base, then removes label"
 echo "### Scenario D: recorded target branch is gone -> give up cleanly"
 setup_repo
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"   # matches marker -> not a manual retarget
+PR_BASE="parent"   # matches marker -> not a manual retarget
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent ghost-target "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
@@ -174,7 +178,23 @@ grep -q -- "--base" "$CALLS" && fail "D: base must NOT be edited"
 ok "D: missing target detected, no branch mutation, label removed"
 
 # ---------------------------------------------------------------------------
-echo "### Scenario E: recorded base branch is gone -> give up cleanly, no crash"
+echo "### Scenario E: malformed state marker -> internal error, die without touching the PR"
+setup_repo
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; echo '<!-- autorestack-state: base=parent target=main -->'; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=1" "$WORK/out.log" || fail "E: run must die on a malformed marker"
+grep -q "remove-label" "$CALLS" && fail "E: label must stay on"
+grep -q "gh pr comment" "$CALLS" && fail "E: no PR comment for an internal error"
+grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
+ok "E: malformed marker dies, PR untouched, label kept"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario F: recorded base branch is gone -> give up cleanly, no crash"
 setup_repo
 # Advance main with the squash commit so the child is not already up to date and
 # the resume would actually reach the merge step.
@@ -190,55 +210,55 @@ git checkout -q child
 # repeating on every push.
 git push -q origin ":parent"
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"   # matches marker -> not a manual retarget
+PR_BASE="parent"   # matches marker -> not a manual retarget
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH2"; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
-grep -q "EXIT=" "$WORK/out.log" && fail "E: script exited nonzero: $(cat "$WORK/out.log")"
-grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "E: label not removed"
-grep -q -- "add-label" "$CALLS" && fail "E: conflict label must NOT be re-added"
-grep -q "gh pr comment" "$CALLS" || fail "E: no explanatory comment posted"
-grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
-[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
-ok "E: missing base branch detected, no crash, label removed"
+grep -q "EXIT=" "$WORK/out.log" && fail "F: script exited nonzero: $(cat "$WORK/out.log")"
+grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "F: label not removed"
+grep -q -- "add-label" "$CALLS" && fail "F: conflict label must NOT be re-added"
+grep -q "gh pr comment" "$CALLS" || fail "F: no explanatory comment posted"
+grep -q -- "--base" "$CALLS" && fail "F: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "F: child was pushed"
+ok "F: missing base branch detected, no crash, label removed"
 
 # ---------------------------------------------------------------------------
-echo "### Scenario F: reading the PR comments fails -> fail the run, keep the label"
+echo "### Scenario G: reading the PR comments fails -> fail the run, keep the label"
 setup_repo
-# A transient API failure while reading the comments must not pass for "no
-# state marker": that path removes the conflict label and permanently cancels
-# the auto-resume. The run must fail loudly instead, so the next push retries.
+# An API failure must not pass for "no state marker": that path removes the
+# conflict label and permanently cancels the auto-resume. Fail loudly instead,
+# so the label stays on and the next push retries.
 MOCK_LABELS="autorestack-needs-conflict-resolution"
-MOCK_BASE="parent"
+PR_BASE="parent"
 MOCK_COMMENTS_FILE="$WORK/does-not-exist"   # makes the mock gh fail on pr view --json comments
 run_resume
 
-grep -q "EXIT=" "$WORK/out.log" || fail "F: run should have failed"
-grep -q "remove-label" "$CALLS" && fail "F: label must NOT be removed on an API failure"
-grep -q "gh pr comment" "$CALLS" && fail "F: no comment must be posted on an API failure"
-[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "F: child was pushed"
-ok "F: API failure fails the run and keeps the resume armed"
+grep -q "EXIT=" "$WORK/out.log" || fail "G: run should have failed"
+grep -q "remove-label" "$CALLS" && fail "G: label must NOT be removed on an API failure"
+grep -q "gh pr comment" "$CALLS" && fail "G: no comment must be posted on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "G: child was pushed"
+ok "G: comments API failure fails the run and keeps the resume armed"
 
 # ---------------------------------------------------------------------------
-echo "### Scenario G: reading the labels fails -> fail the run, do nothing"
+echo "### Scenario H: reading the labels fails -> fail the run, do nothing"
 setup_repo
 # An API failure must not pass for "no conflict label": that ends the run
 # green without resuming anything.
 MOCK_LABELS=""
 MOCK_LABELS_FAIL=1
-MOCK_BASE="parent"
+PR_BASE="parent"
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
-grep -q "EXIT=" "$WORK/out.log" || fail "G: run should have failed, not ended green"
-grep -q "remove-label" "$CALLS" && fail "G: label must NOT be touched on an API failure"
-[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "G: child was pushed"
-ok "G: labels API failure fails the run instead of skipping the resume"
+grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed, not ended green"
+grep -q "remove-label" "$CALLS" && fail "H: label must NOT be touched on an API failure"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "H: child was pushed"
+ok "H: labels API failure fails the run instead of skipping the resume"
 
 # ---------------------------------------------------------------------------
-echo "### Scenario H: listing sibling conflicts fails -> keep the old base branch"
+echo "### Scenario I: listing sibling conflicts fails -> keep the old base branch"
 setup_repo
 # Same successful-resume setup as scenario C, but the sibling listing that
 # decides whether the old base branch can be deleted fails. Answering "no
@@ -247,16 +267,16 @@ git -C "$WORK" merge -q --no-edit main
 git -C "$WORK" push -q origin child
 MOCK_LABELS="autorestack-needs-conflict-resolution"
 MOCK_LABELS_FAIL=""
-MOCK_BASE="parent"
+PR_BASE="parent"
 MOCK_PR_LIST_FAIL=1
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
 
-grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed"
-git -C "$ORIGIN" rev-parse --verify -q parent >/dev/null || fail "H: old base branch was deleted on an API failure"
-grep -q -- "push origin :parent" "$CALLS" && fail "H: deletion must not be attempted"
-ok "H: sibling-listing API failure keeps the old base branch"
+grep -q "EXIT=" "$WORK/out.log" || fail "I: run should have failed"
+git -C "$ORIGIN" rev-parse --verify -q parent >/dev/null || fail "I: old base branch was deleted on an API failure"
+grep -q -- "push origin :parent" "$CALLS" && fail "I: deletion must not be attempted"
+ok "I: sibling-listing API failure keeps the old base branch"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"
