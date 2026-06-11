@@ -44,7 +44,8 @@ format_state_marker() {
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
-    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body'); then
+    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments \
+            --jq '.comments[] | select(.viewerDidAuthor) | .body'); then
         echo "Error: could not read comments of PR #$PR_NUMBER" >&2
         exit 1
     fi
@@ -306,6 +307,11 @@ continue_after_resolution() {
     local OLD_BASE NEW_TARGET SQUASH_HASH
     read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
     echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
+
+    if [[ -z "$OLD_BASE" || -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
+        echo "Error: malformed state marker on $PR_BRANCH: $MARKER" >&2
+        exit 1
+    fi
 
     # The PR was left based on the merged parent branch. If the payload shows a
     # different base, a human retargeted the PR; the recorded target is stale,

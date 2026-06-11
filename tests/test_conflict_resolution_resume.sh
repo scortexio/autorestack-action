@@ -33,7 +33,11 @@ echo "gh $*" >> "$CALLS"
 if [[ "$1 $2" == "pr view" ]]; then
     case "$*" in
         *--json\ labels*)   printf '%s\n' "${MOCK_LABELS:-}";;
-        *--json\ comments*) cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
+        *--json\ comments*)
+            # The comments file stands for our own comments only, so the query
+            # must restrict itself to those.
+            [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
+            cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
 elif [[ "$1 $2" == "pr comment" ]]; then
@@ -166,6 +170,22 @@ grep -q "gh pr comment" "$CALLS" || fail "D: no explanatory comment posted"
 grep -q -- "--base" "$CALLS" && fail "D: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "D: child was pushed"
 ok "D: missing target detected, no branch mutation, label removed"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario E: malformed state marker -> internal error, die without touching the PR"
+setup_repo
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; echo '<!-- autorestack-state: base=parent target=main -->'; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=1" "$WORK/out.log" || fail "E: run must die on a malformed marker"
+grep -q "remove-label" "$CALLS" && fail "E: label must stay on"
+grep -q "gh pr comment" "$CALLS" && fail "E: no PR comment for an internal error"
+grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
+ok "E: malformed marker dies, PR untouched, label kept"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"
