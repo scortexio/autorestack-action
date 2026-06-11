@@ -187,5 +187,35 @@ grep -q -- "--base" "$CALLS" && fail "E: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "E: child was pushed"
 ok "E: malformed marker dies, PR untouched, label kept"
 
+# ---------------------------------------------------------------------------
+echo "### Scenario F: recorded base branch is gone -> give up cleanly, no crash"
+setup_repo
+# Advance main with the squash commit so the child is not already up to date and
+# the resume would actually reach the merge step.
+git checkout -q main
+echo squash > s.txt && git add s.txt && git commit -qm squash
+SQUASH2=$(git rev-parse main)
+git push -q origin main
+git checkout -q child
+# The kept parent branch was deleted (auto-delete head branches left enabled, or
+# manual deletion). Before the up-front check, the resume tried to merge the
+# missing ref, failed `git merge --abort` because no merge was in progress, and
+# exited nonzero after re-posting a misleading conflict comment and the label,
+# repeating on every push.
+git push -q origin ":parent"
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"   # matches marker -> not a manual retarget
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH2"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" && fail "F: script exited nonzero: $(cat "$WORK/out.log")"
+grep -q "remove-label autorestack-needs-conflict-resolution" "$CALLS" || fail "F: label not removed"
+grep -q -- "add-label" "$CALLS" && fail "F: conflict label must NOT be re-added"
+grep -q "gh pr comment" "$CALLS" || fail "F: no explanatory comment posted"
+grep -q -- "--base" "$CALLS" && fail "F: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "F: child was pushed"
+ok "F: missing base branch detected, no crash, label removed"
+
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"

@@ -142,6 +142,16 @@ list_child_prs() {
     log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"'
 }
 
+# A failed git merge does not always leave a merge in progress: when the ref to
+# merge does not exist ("not something we can merge"), there is no MERGE_HEAD,
+# and `git merge --abort` itself fails ("There is no merge to abort"). Only
+# abort when a merge is actually in progress.
+abort_merge_if_in_progress() {
+    if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+        log_cmd git merge --abort
+    fi
+}
+
 # Args: head branch, base branch, PR number. git commands use the branch; gh
 # commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
@@ -167,14 +177,14 @@ update_direct_target() {
     if ! log_cmd git merge --no-edit "origin/$MERGED_BRANCH"; then
         CONFLICTS+=("origin/$MERGED_BRANCH")
         BASE_MERGE_CLEAN=false
-        log_cmd git merge --abort
+        abort_merge_if_in_progress
     fi
     # Only try merging the pre-squash target state if it's not already
     # included in the merged branch — otherwise the first merge covers it.
     if ! git merge-base --is-ancestor SQUASH_COMMIT~ "origin/$MERGED_BRANCH"; then
         if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
             CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)  # $TARGET_BRANCH just before $MERGED_BRANCH was merged" )
-            log_cmd git merge --abort
+            abort_merge_if_in_progress
         fi
     fi
 
@@ -329,6 +339,16 @@ continue_after_resolution() {
     if ! git rev-parse --verify --quiet "origin/$NEW_TARGET" >/dev/null; then
         echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; abandoning resume of $PR_BRANCH."
         abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
+        return
+    fi
+
+    # Same check for the old base: the resume re-merges origin/$OLD_BASE, so if
+    # that branch is gone (auto-delete head branches left enabled, or deleted
+    # manually) the merge can never succeed and the label would re-trigger a
+    # failing run on every push. Give up cleanly instead.
+    if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
+        echo "⚠️ Recorded base branch '$OLD_BASE' no longer exists; abandoning resume of $PR_BRANCH."
+        abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was based on (\`$OLD_BASE\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
         return
     fi
 
