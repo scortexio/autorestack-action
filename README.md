@@ -135,6 +135,7 @@ jobs:
 * Built for squash merges. A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch. Rebase merges are not supported: the action detects them through GitHub's commit-PR association (the merge method itself is recorded nowhere) and comments on each child PR instead of acting.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
+* After retargeting, GitHub sometimes keeps rendering a PR's diff against its old, deleted base, so the PR appears to contain already-merged changes. The branch itself is correct (`git diff <base>...HEAD` shows the real diff). Pushing any commit to the PR usually makes GitHub recompute. Sometimes it doesn't. Tough luck.
 
 ---
 
