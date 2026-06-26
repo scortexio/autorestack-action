@@ -12,6 +12,7 @@
 # PR_BRANCH - The head branch of the PR being resumed
 # PR_NUMBER - Its PR number, from the event payload
 # PR_BASE   - Its base branch, from the event payload
+# GITHUB_REPOSITORY - "owner/repo", provided by Actions
 #
 # Design note:
 # This script aims to output a transcript of "plain" git/gh commands that a
@@ -44,8 +45,19 @@ format_state_marker() {
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
-    if ! BODIES=$(gh pr view "$PR_NUMBER" --json comments \
-            --jq '.comments[] | select(.viewerDidAuthor) | .body'); then
+    if ! BODIES=$(gh api graphql --paginate \
+            -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" \
+            -F number="$PR_NUMBER" -f query='
+        query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    comments(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { viewerDidAuthor body }
+                    }
+                }
+            }
+        }' --jq '.data.repository.pullRequest.comments.nodes[] | select(.viewerDidAuthor) | .body'); then
         echo "Error: could not read comments of PR #$PR_NUMBER" >&2
         exit 1
     fi
@@ -139,7 +151,8 @@ is_rebase_merge() {
 
 # Echoes "<number> <head branch>" for each open PR based on the merged branch.
 list_child_prs() {
-    log_cmd gh pr list --base "$MERGED_BRANCH" --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"'
+    log_cmd gh api "repos/{owner}/{repo}/pulls?base=$MERGED_BRANCH&state=open&per_page=100" \
+        --paginate --jq '.[] | "\(.number) \(.head.ref)"'
 }
 
 # A failed git merge does not always leave a merge in progress: when the ref to
@@ -244,7 +257,8 @@ has_sibling_conflicts() {
 
     # Find all open PRs with the conflict label that are based on BASE_BRANCH
     local CONFLICTED_SIBLINGS
-    CONFLICTED_SIBLINGS=$(gh pr list --base "$BASE_BRANCH" --label "$CONFLICT_LABEL" --json headRefName --jq '.[].headRefName' 2>/dev/null || echo "")
+    CONFLICTED_SIBLINGS=$(gh api "repos/{owner}/{repo}/pulls?base=$BASE_BRANCH&state=open&per_page=100" \
+        --paginate --jq ".[] | select(any(.labels[]; .name == \"$CONFLICT_LABEL\")) | .head.ref" 2>/dev/null || echo "")
 
     for SIBLING in $CONFLICTED_SIBLINGS; do
         if [[ "$SIBLING" != "$EXCLUDE_BRANCH" ]]; then
@@ -270,6 +284,7 @@ continue_after_resolution() {
     check_env_var "PR_BRANCH"
     check_env_var "PR_NUMBER"
     check_env_var "PR_BASE"
+    check_env_var "GITHUB_REPOSITORY"
 
     echo "Checking if PR #$PR_NUMBER ($PR_BRANCH) needs continuation after conflict resolution..."
 
