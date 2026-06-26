@@ -339,7 +339,10 @@ continue_after_resolution() {
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     log_cmd git checkout "$PR_BRANCH"
     if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
-        echo "⚠️ '$PR_BRANCH' does not contain the squash commit yet; resolution incomplete, will retry on next push"
+        # Fail loudly rather than silently: the user pushed without finishing the
+        # re-parent, so a red run is the signal they need to look again.
+        echo "❌ '$PR_BRANCH' does not contain the squash commit; the conflict is not resolved." >&2
+        echo "   Follow the conflict comment on this PR (run its git-merge-onto command), then push again." >&2
         return 1
     fi
 
