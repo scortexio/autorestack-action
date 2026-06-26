@@ -41,7 +41,7 @@ jobs:
       # comment, which calls `uvx git-merge-onto`. The action itself uses the
       # vendored copy via python3 and needs no uv.
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Run e2e tests
         env:
