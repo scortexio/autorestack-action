@@ -252,7 +252,7 @@ get_conflict_comment() {
     local comment
     local count
 
-    comments=$(log_cmd gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '[.comments[] | select(.body | contains("Automatic update blocked by merge conflicts")) | .body]')
+    comments=$(log_cmd gh pr view "$pr_url" --repo "$REPO_FULL_NAME" --json comments --jq '[.comments[] | select(.body | contains("Automatic update blocked by")) | .body]')
     count=$(echo "$comments" | jq 'length')
     comment=$(echo "$comments" | jq -r '.[-1] // ""')
     if [[ -n "$expected_count" && "$count" != "$expected_count" ]]; then
@@ -276,15 +276,16 @@ get_conflict_comment() {
 }
 
 # The conflict comment must tell the user to run the re-parent the action tried:
-# a single `uvx git-merge-onto <squash> origin/<merged branch>`.
+# a single `uvx git-merge-onto origin/<target> origin/<merged branch>`.
 assert_conflict_comment_reparent() {
     local comment=$1
-    local merged=$2
+    local target=$2
+    local merged=$3
 
-    if echo "$comment" | grep -qE "^uvx git-merge-onto [0-9a-f]{7,40} origin/${merged}\$"; then
-        echo >&2 "✅ Verification Passed: conflict comment has the re-parent command for origin/$merged."
+    if echo "$comment" | grep -qxF "uvx git-merge-onto origin/$target origin/$merged"; then
+        echo >&2 "✅ Verification Passed: conflict comment re-parents origin/$merged onto origin/$target."
     else
-        echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx git-merge-onto <squash> origin/$merged'."
+        echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx git-merge-onto origin/$target origin/$merged'."
         echo >&2 "--- Full comment ---"
         echo >&2 "$comment"
         exit 1
@@ -1018,7 +1019,7 @@ echo >&2 "Checking for conflict comment on PR #$PR3_NUM..."
 # Give GitHub some time to process the comment
 sleep 5
 CONFLICT_COMMENT=$(get_conflict_comment "$PR3_URL" "$PR3_NUM" 1)
-assert_conflict_comment_reparent "$CONFLICT_COMMENT" "feature2"
+assert_conflict_comment_reparent "$CONFLICT_COMMENT" "main" "feature2"
 
 # Verify conflict label exists on PR3
 echo >&2 "Checking for conflict label on PR #$PR3_NUM..."
@@ -1257,8 +1258,8 @@ echo >&2 "Checking for conflict comments on PR #$PR6_NUM and PR #$PR7_NUM..."
 sleep 5
 PR6_CONFLICT_COMMENT=$(get_conflict_comment "$PR6_URL" "$PR6_NUM" 1)
 PR7_CONFLICT_COMMENT=$(get_conflict_comment "$PR7_URL" "$PR7_NUM" 1)
-assert_conflict_comment_reparent "$PR6_CONFLICT_COMMENT" "feature5"
-assert_conflict_comment_reparent "$PR7_CONFLICT_COMMENT" "feature5"
+assert_conflict_comment_reparent "$PR6_CONFLICT_COMMENT" "main" "feature5"
+assert_conflict_comment_reparent "$PR7_CONFLICT_COMMENT" "main" "feature5"
 
 # 19. Resolve first sibling (feature6) - feature5 should still be kept
 echo >&2 "19. Resolving first sibling (feature6) by following the posted comment..."
