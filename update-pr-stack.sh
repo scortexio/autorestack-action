@@ -171,7 +171,7 @@ update_direct_target() {
 
     echo "Updating direct target $BRANCH (from $MERGED_BRANCH to $BASE_BRANCH)"
 
-    local MERGE_MSG="Merge updates from $BASE_BRANCH and squash commit"
+    local MERGE_MSG="Merge updates from $BASE_BRANCH and $MERGED_BRANCH"
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         MERGE_MSG="$MERGE_MSG
 
