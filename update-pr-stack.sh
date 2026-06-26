@@ -171,79 +171,58 @@ update_direct_target() {
 
     echo "Updating direct target $BRANCH (from $MERGED_BRANCH to $BASE_BRANCH)"
 
-    CONFLICTS=()
-    local BASE_MERGE_CLEAN=true
-    log_cmd git update-ref BEFORE_MERGE HEAD
-    if ! log_cmd git merge --no-edit "origin/$MERGED_BRANCH"; then
-        CONFLICTS+=("origin/$MERGED_BRANCH")
-        BASE_MERGE_CLEAN=false
-        abort_merge_if_in_progress
-    fi
-    # Only try merging the pre-squash target state if it's not already
-    # included in the merged branch — otherwise the first merge covers it.
-    if ! git merge-base --is-ancestor SQUASH_COMMIT~ "origin/$MERGED_BRANCH"; then
-        if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
-            CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)  # $TARGET_BRANCH just before $MERGED_BRANCH was merged" )
-            abort_merge_if_in_progress
-        fi
-    fi
-
-    if [[ "${#CONFLICTS[@]}" -gt 0 ]]; then
-        # When the base-branch merge was clean, HEAD now holds it (the
-        # conflicting pre-squash merge was aborted back to it). Push it before
-        # asking for help: the user resolves on top of it, and the head stays a
-        # descendant of its base so the PR stays mergeable and the synchronize
-        # event that resumes this action still fires. GitHub does not run
-        # pull_request workflows on a PR conflicting with its base, which would
-        # otherwise strand the branch for good. If the base merge itself
-        # conflicted we have nothing safe to pre-push, so we just ask for help.
-        # Note: ordering is important here: if we label before pushing, we
-        # re-trigger ourselves immediately.
-        if [[ "$BASE_MERGE_CLEAN" == true ]]; then
-            log_cmd git push origin "$BRANCH"
-        fi
-        {
-            echo "### ⚠️ Automatic update blocked by merge conflicts"
-            echo
-            echo "Resolve them like this:"
-            echo '```bash'
-            echo "git fetch origin"
-            echo "git switch $BRANCH"
-            echo "git merge --ff-only origin/$BRANCH"
-
-            for i in "${!CONFLICTS[@]}"; do
-                echo "git merge ${CONFLICTS[$i]}"
-                echo '```'
-                echo
-                echo 'Fix the conflicts (for instance with `git mergetool`), then run `git commit` before continuing.'
-                echo
-                echo '```bash'
-            done
-            echo "git push origin $BRANCH"
-            echo '```'
-            echo
-            echo "Once you push, this action will resume and finish updating this pull request."
-            echo
-            format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
-        } | log_cmd gh pr comment "$PR_NUMBER" -F -
-        # Create the label if it doesn't exist, then add it to the PR
-        gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
-        log_cmd gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
-        return 1
-    else
-        log_cmd git merge --no-edit -s ours SQUASH_COMMIT
-        log_cmd git update-ref MERGE_RESULT "HEAD^{tree}"
-        COMMIT_MSG="Merge updates from $BASE_BRANCH and squash commit"
-        if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-            COMMIT_MSG="$COMMIT_MSG
+    local MERGE_MSG="Merge updates from $BASE_BRANCH and squash commit"
+    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+        MERGE_MSG="$MERGE_MSG
 
 See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-        fi
-        CUSTOM_COMMIT=$(log_cmd git commit-tree MERGE_RESULT -p BEFORE_MERGE -p "origin/$MERGED_BRANCH" -p SQUASH_COMMIT -m "$COMMIT_MSG")
-        log_cmd git reset --hard "$CUSTOM_COMMIT"
     fi
 
-    return 0
+    # Re-parent the child onto the target in a single merge: merge the squash
+    # commit with the base forced to merge-base(HEAD, origin/$MERGED_BRANCH). That
+    # drops the merged branch's content (now carried by the target via the squash)
+    # while keeping the child's own changes -- the merge equivalent of
+    # `git rebase --onto`, done by the vendored git-merge-onto.
+    local RC=0
+    log_cmd python3 "$SCRIPT_DIR/git-merge-onto" -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
+    if [[ "$RC" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$RC" -ne 1 ]]; then
+        echo "❌ git-merge-onto failed (exit $RC) while re-parenting $BRANCH" >&2
+        exit 1
+    fi
+
+    # Conflict (exit 1): git-merge-onto committed nothing and left the merge in
+    # progress, so the head is unchanged and still a descendant of its base -- the
+    # PR stays mergeable and the synchronize event that resumes this action keeps
+    # firing. Clean the runner's tree, ask the user to resolve, and record the state
+    # so the next push can resume. The label comes last: it is what re-triggers us.
+    abort_merge_if_in_progress
+    {
+        echo "### ⚠️ Automatic update blocked by a merge conflict"
+        echo
+        echo "Resolve it like this:"
+        echo '```bash'
+        echo "git fetch origin"
+        echo "git switch $BRANCH"
+        echo "git merge --ff-only origin/$BRANCH"
+        echo "uvx git-merge-onto $(git rev-parse SQUASH_COMMIT) origin/$MERGED_BRANCH"
+        echo '```'
+        echo
+        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
+        echo
+        echo '```bash'
+        echo "git push origin $BRANCH"
+        echo '```'
+        echo
+        echo "Once you push, this action will resume and finish updating this pull request."
+        echo
+        format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
+    } | log_cmd gh pr comment "$PR_NUMBER" -F -
+    gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
+    log_cmd gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
+    return 1
 }
 
 # Check if a PR has the conflict resolution label.
@@ -342,22 +321,21 @@ continue_after_resolution() {
         return
     fi
 
-    # Same check for the old base: the resume re-merges origin/$OLD_BASE, so if
-    # that branch is gone (auto-delete head branches left enabled, or deleted
-    # manually) the merge can never succeed and the label would re-trigger a
-    # failing run on every push. Give up cleanly instead.
+    # Same check for the old base: the resume re-runs git-merge-onto against
+    # origin/$OLD_BASE, so if that branch is gone (auto-delete head branches left
+    # enabled, or deleted manually) it can never resolve and the label would
+    # re-trigger a failing run on every push. Give up cleanly instead.
     if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
         echo "⚠️ Recorded base branch '$OLD_BASE' no longer exists; abandoning resume of $PR_BRANCH."
         abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was based on (\`$OLD_BASE\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
         return
     fi
 
-    # The squash-merge run pushed the base merge and asked the user to resolve the
-    # pre-squash merge, but it never recorded the squash itself. Finish that now:
-    # re-run the same merge sequence as the squash-merge path. With the user's
-    # resolution in place the base merge and pre-squash merge are no-ops; only the
-    # "-s ours" squash record gets applied, keeping the diff against the new base
-    # clean. has_squash_commit makes this idempotent.
+    # The squash-merge run asked the user to resolve the re-parent and recorded the
+    # state, but committed nothing. Re-run the same re-parent now: with the user's
+    # resolution pushed, git-merge-onto is a no-op (the squash is already an
+    # ancestor of the resolved head), so update_direct_target just confirms the
+    # branch and moves on. has_squash_commit makes this idempotent.
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     MERGED_BRANCH="$OLD_BASE"
     TARGET_BRANCH="$NEW_TARGET"

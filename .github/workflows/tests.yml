@@ -37,6 +37,12 @@ jobs:
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
           owner: autorestack-test
 
+      # The e2e simulates a human resolving a conflict by running the posted
+      # comment, which calls `uvx git-merge-onto`. The action itself uses the
+      # vendored copy via python3 and needs no uv.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+
       - name: Run e2e tests
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
