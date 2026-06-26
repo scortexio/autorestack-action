@@ -18,11 +18,14 @@ This action tries to fix that in a transparent way. Install it, and hopefully th
 
 1. Triggers when a PR is squash merged
 2. Finds PRs that were based on the merged branch (direct children only)
-3. Creates a synthetic merge commit with three parents (child tip, deleted branch tip, squash commit) to preserve history without re-introducing code
-4. Updates the direct child PRs to base on trunk now that the bottom change has landed
-5. Pushes updated branches and deletes the merged branch
+3. Re-parents each child onto the trunk with a single merge — [git-merge-onto](https://github.com/scortexio/git-merge-onto), the merge equivalent of `git rebase --onto` — so the squashed branch's content is dropped without rewriting history
+4. Pushes the updated branches
+5. Updates the direct child PRs to base on trunk now that the bottom change has landed
+6. Deletes the merged branch
 
-**Note:** Indirect descendants (grandchildren, etc.) are intentionally not modified. Their PR diffs remain correct because the merge-base calculation still works—the synthetic merge commit includes the original parent commit as an ancestor. When their direct parent is eventually merged, they become direct children and get updated at that point.
+The re-parent primitive ([git-merge-onto](https://github.com/scortexio/git-merge-onto)) is vendored as a single zero-dependency file and run with `python3`, so the action needs no network download.
+
+**Note:** Indirect descendants (grandchildren, etc.) are intentionally not modified. Their PR diffs remain correct because the merge-base calculation still works—the re-parent merge keeps the child's original commit as a parent. When their direct parent is eventually merged, they become direct children and get updated at that point.
 
 ### Conflict handling
 
@@ -60,7 +63,7 @@ gh api -X PATCH "/repos/OWNER/REPO" --input - <<< '{"delete_branch_on_merge":fal
 
 **2. Create a GitHub App**
 
-When autorestack pushes the synthetic merge commit to upstack branches, you probably want CI to run on those PRs so they can become mergeable. Pushes made with the default `GITHUB_TOKEN` [do not trigger workflow runs](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) — this is a deliberate GitHub limitation to prevent infinite loops. A GitHub App installation token does not have this limitation.
+When autorestack pushes the re-parent merge commit to upstack branches, you probably want CI to run on those PRs so they can become mergeable. Pushes made with the default `GITHUB_TOKEN` [do not trigger workflow runs](https://docs.github.com/en/actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) — this is a deliberate GitHub limitation to prevent infinite loops. A GitHub App installation token does not have this limitation.
 
 1. [Create a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app) with the following repository permissions:
    - **Contents:** Read and write (to push branches)
@@ -78,6 +81,10 @@ name: Update PR Stack
 on:
   pull_request:
     types: [closed, synchronize]
+
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 jobs:
   update-pr-stack:
@@ -110,6 +117,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: update-pr-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   update-pr-stack:
     runs-on: ubuntu-latest
@@ -123,9 +134,10 @@ jobs:
 
 ### Notes
 
-* Currently only supports squash merges
+* Built for squash merges. A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch. Rebase merges are not supported: the action detects them through GitHub's commit-PR association (the merge method itself is recorded nowhere) and comments on each child PR instead of acting.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
+* After retargeting, GitHub sometimes keeps rendering a PR's diff against its old, deleted base, so the PR appears to contain already-merged changes. The branch itself is correct (`git diff <base>...HEAD` shows the real diff). Pushing any commit to the PR usually makes GitHub recompute. Sometimes it doesn't. Tough luck.
 
 ---
 

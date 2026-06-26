@@ -2,10 +2,17 @@
 #
 # Updates PR stack after merging a PR
 #
-# Required environment variables:
+# Required environment variables (squash-merge mode):
 # SQUASH_COMMIT - The hash of the squash commit that was merged
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
 # TARGET_BRANCH - The name of the branch that the PR was merged into
+# PR_NUMBER - The number of the PR that was merged
+#
+# Required environment variables (conflict-resolved mode):
+# PR_BRANCH - The head branch of the PR being resumed
+# PR_NUMBER - Its PR number, from the event payload
+# PR_BASE   - Its base branch, from the event payload
+# GITHUB_REPOSITORY - "owner/repo", provided by Actions
 #
 # Design note:
 # This script aims to output a transcript of "plain" git/gh commands that a
@@ -36,9 +43,25 @@ format_state_marker() {
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
 read_state_marker() {
-    local PR_BRANCH="$1"
-    gh pr view "$PR_BRANCH" --json comments --jq '.comments[].body' 2>/dev/null \
-        | { grep -F "$STATE_MARKER_PREFIX" || true; } | tail -n1
+    local PR_NUMBER="$1"
+    local BODIES
+    if ! BODIES=$(gh api graphql --paginate \
+            -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" \
+            -F number="$PR_NUMBER" -f query='
+        query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+            repository(owner: $owner, name: $repo) {
+                pullRequest(number: $number) {
+                    comments(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { viewerDidAuthor body }
+                    }
+                }
+            }
+        }' --jq '.data.repository.pullRequest.comments.nodes[] | select(.viewerDidAuthor) | .body'); then
+        echo "Error: could not read comments of PR #$PR_NUMBER" >&2
+        exit 1
+    fi
+    { grep -F "$STATE_MARKER_PREFIX" <<<"$BODIES" || true; } | tail -n1
 }
 
 # Args: a marker line. Echoes "base target squash".
@@ -71,9 +94,80 @@ has_squash_commit() {
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
 }
 
+# Args: a commit sha. Echoes the numbers of the pull requests that introduced
+# the commit to the repository, one per line.
+commit_pull_numbers() {
+    gh api "repos/{owner}/{repo}/commits/$1/pulls" --jq '.[].number' \
+        || { echo "❌ Could not list the pull requests that introduced commit $1" >&2; return 1; }
+}
+
+# Args: the merge commit sha, the merged PR's number. The association is
+# computed asynchronously, some time after the merge. The merge commit always
+# belongs to the merged PR, so once it shows up the index has caught up with
+# this merge; until then, an empty answer for any commit of the merge means
+# nothing. Exits if the association never appears.
+wait_for_pull_association() {
+    local MERGE_SHA="$1" PR_NUMBER="$2"
+    local NUMBERS
+    for _ in $(seq 1 24); do
+        NUMBERS=$(commit_pull_numbers "$MERGE_SHA") || exit 1
+        if grep -qx "$PR_NUMBER" <<<"$NUMBERS"; then
+            return 0
+        fi
+        sleep "${ASSOCIATION_POLL_SECONDS:-5}"
+    done
+    echo "❌ GitHub never associated $MERGE_SHA with PR #$PR_NUMBER; cannot tell a squash from a rebase" >&2
+    exit 1
+}
+
+# Args: the merged PR's number. The event payload does not say which merge
+# method was used (GitHub records it nowhere), but GitHub associates every
+# trunk commit with the PR that introduced it. A squash introduces a single
+# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
+# none; a rebase introduces a copy of each PR commit, so with two or more
+# commits the one below SQUASH_COMMIT still belongs to this PR. A
+# single-commit PR merges identically under rebase and squash and correctly
+# reads as a squash here.
+is_rebase_merge() {
+    local PR_NUMBER="$1"
+    local MERGE_SHA PARENT_SHA NUMBERS
+    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
+    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
+
+    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    if [[ -z "$NUMBERS" ]]; then
+        # Ambiguous: "no PR introduced this commit" (a squash on top of a
+        # direct push) and "not indexed yet" (a rebase copy) both come back
+        # empty. Wait until the index has caught up with this merge, then ask
+        # again; this time empty really means no PR.
+        wait_for_pull_association "$MERGE_SHA" "$PR_NUMBER"
+        NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
+    fi
+    grep -qx "$PR_NUMBER" <<<"$NUMBERS"
+}
+
+# Echoes "<number> <head branch>" for each open PR based on the merged branch.
+list_child_prs() {
+    log_cmd gh api "repos/{owner}/{repo}/pulls?base=$MERGED_BRANCH&state=open&per_page=100" \
+        --paginate --jq '.[] | "\(.number) \(.head.ref)"'
+}
+
+# A failed git merge does not always leave a merge in progress: when the ref to
+# merge does not exist ("not something we can merge"), there is no MERGE_HEAD,
+# and `git merge --abort` itself fails ("There is no merge to abort"). Only
+# abort when a merge is actually in progress.
+abort_merge_if_in_progress() {
+    if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+        log_cmd git merge --abort
+    fi
+}
+
+# Args: head branch, base branch, PR number. git commands use the branch; gh
+# commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
     local BRANCH="$1"
     local BASE_BRANCH="$2"
+    local PR_NUMBER="$3"
 
     log_cmd git checkout "$BRANCH"
 
@@ -86,86 +180,68 @@ update_direct_target() {
 
     echo "Updating direct target $BRANCH (from $MERGED_BRANCH to $BASE_BRANCH)"
 
-    CONFLICTS=()
-    local BASE_MERGE_CLEAN=true
-    log_cmd git update-ref BEFORE_MERGE HEAD
-    if ! log_cmd git merge --no-edit "origin/$MERGED_BRANCH"; then
-        CONFLICTS+=("origin/$MERGED_BRANCH")
-        BASE_MERGE_CLEAN=false
-        log_cmd git merge --abort
-    fi
-    # Only try merging the pre-squash target state if it's not already
-    # included in the merged branch — otherwise the first merge covers it.
-    if ! git merge-base --is-ancestor SQUASH_COMMIT~ "origin/$MERGED_BRANCH"; then
-        if ! log_cmd git merge --no-edit SQUASH_COMMIT~; then
-            CONFLICTS+=( "$(git rev-parse SQUASH_COMMIT~)  # $TARGET_BRANCH just before $MERGED_BRANCH was merged" )
-            log_cmd git merge --abort
-        fi
-    fi
-
-    if [[ "${#CONFLICTS[@]}" -gt 0 ]]; then
-        # When the base-branch merge was clean, HEAD now holds it (the
-        # conflicting pre-squash merge was aborted back to it). Push it before
-        # asking for help: the user resolves on top of it, and the head stays a
-        # descendant of its base so the PR stays mergeable and the synchronize
-        # event that resumes this action still fires. GitHub does not run
-        # pull_request workflows on a PR conflicting with its base, which would
-        # otherwise strand the branch for good. If the base merge itself
-        # conflicted we have nothing safe to pre-push, so we just ask for help.
-        # Note: ordering is important here: if we label before pushing, we
-        # re-trigger ourselves immediately.
-        if [[ "$BASE_MERGE_CLEAN" == true ]]; then
-            log_cmd git push origin "$BRANCH"
-        fi
-        {
-            echo "### ⚠️ Automatic update blocked by merge conflicts"
-            echo
-            echo "Resolve them like this:"
-            echo '```bash'
-            echo "git fetch origin"
-            echo "git switch $BRANCH"
-            echo "git merge --ff-only origin/$BRANCH"
-
-            for i in "${!CONFLICTS[@]}"; do
-                echo "git merge ${CONFLICTS[$i]}"
-                echo '```'
-                echo
-                echo 'Fix the conflicts (for instance with `git mergetool`), then run `git commit` before continuing.'
-                echo
-                echo '```bash'
-            done
-            echo "git push origin $BRANCH"
-            echo '```'
-            echo
-            echo "Once you push, this action will resume and finish updating this pull request."
-            echo
-            format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
-        } | log_cmd gh pr comment "$BRANCH" -F -
-        # Create the label if it doesn't exist, then add it to the PR
-        gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
-        log_cmd gh pr edit "$BRANCH" --add-label "$CONFLICT_LABEL"
-        return 1
-    else
-        log_cmd git merge --no-edit -s ours SQUASH_COMMIT
-        log_cmd git update-ref MERGE_RESULT "HEAD^{tree}"
-        COMMIT_MSG="Merge updates from $BASE_BRANCH and squash commit"
-        if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-            COMMIT_MSG="$COMMIT_MSG
+    local MERGE_MSG="Merge updates from $BASE_BRANCH and $MERGED_BRANCH"
+    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+        MERGE_MSG="$MERGE_MSG
 
 See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-        fi
-        CUSTOM_COMMIT=$(log_cmd git commit-tree MERGE_RESULT -p BEFORE_MERGE -p "origin/$MERGED_BRANCH" -p SQUASH_COMMIT -m "$COMMIT_MSG")
-        log_cmd git reset --hard "$CUSTOM_COMMIT"
     fi
 
-    return 0
+    # Re-parent the child onto the target in a single merge: merge the squash
+    # commit with the base forced to merge-base(HEAD, origin/$MERGED_BRANCH). That
+    # drops the merged branch's content (now carried by the target via the squash)
+    # while keeping the child's own changes -- the merge equivalent of
+    # `git rebase --onto`, done by the vendored git-merge-onto.
+    local RC=0
+    log_cmd python3 "$SCRIPT_DIR/git-merge-onto" -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
+    if [[ "$RC" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$RC" -ne 1 ]]; then
+        echo "❌ git-merge-onto failed (exit $RC) while re-parenting $BRANCH" >&2
+        exit 1
+    fi
+
+    # Conflict (exit 1): git-merge-onto committed nothing and left the merge in
+    # progress, so the head is unchanged and still a descendant of its base -- the
+    # PR stays mergeable and the synchronize event that resumes this action keeps
+    # firing. Clean the runner's tree, ask the user to resolve, and record the state
+    # so the next push can resume. The label comes last: it is what re-triggers us.
+    abort_merge_if_in_progress
+    {
+        echo "### ⚠️ Automatic update blocked by a merge conflict"
+        echo
+        echo "Resolve it like this:"
+        echo '```bash'
+        echo "git fetch origin"
+        echo "git switch $BRANCH"
+        echo "git merge --ff-only origin/$BRANCH"
+        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo '```'
+        echo
+        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
+        echo
+        echo '```bash'
+        echo "git push origin $BRANCH"
+        echo '```'
+        echo
+        echo "Once you push, this action will resume and finish updating this pull request."
+        echo
+        format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$(git rev-parse SQUASH_COMMIT)"
+    } | log_cmd gh pr comment "$PR_NUMBER" -F -
+    gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
+    log_cmd gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
+    return 1
 }
 
-# Check if a PR has the conflict resolution label
+# Check if a PR has the conflict resolution label.
 pr_has_conflict_label() {
-    local BRANCH="$1"
+    local PR_NUMBER="$1"
     local LABELS
-    LABELS=$(gh pr view "$BRANCH" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+    if ! LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name'); then
+        echo "Error: could not read labels of PR #$PR_NUMBER" >&2
+        exit 1
+    fi
     echo "$LABELS" | grep -q "^${CONFLICT_LABEL}$"
 }
 
@@ -177,7 +253,8 @@ has_sibling_conflicts() {
 
     # Find all open PRs with the conflict label that are based on BASE_BRANCH
     local CONFLICTED_SIBLINGS
-    CONFLICTED_SIBLINGS=$(gh pr list --base "$BASE_BRANCH" --label "$CONFLICT_LABEL" --json headRefName --jq '.[].headRefName' 2>/dev/null || echo "")
+    CONFLICTED_SIBLINGS=$(gh api "repos/{owner}/{repo}/pulls?base=$BASE_BRANCH&state=open&per_page=100" \
+        --paginate --jq ".[] | select(any(.labels[]; .name == \"$CONFLICT_LABEL\")) | .head.ref" 2>/dev/null || echo "")
 
     for SIBLING in $CONFLICTED_SIBLINGS; do
         if [[ "$SIBLING" != "$EXCLUDE_BRANCH" ]]; then
@@ -192,20 +269,23 @@ has_sibling_conflicts() {
 # the conflict label so this action stops re-triggering. Used for the dead-end
 # cases where we cannot or must not finish automatically.
 abandon_resume() {
-    local PR_BRANCH="$1"
+    local PR_NUMBER="$1"
     local MESSAGE="$2"
-    echo "$MESSAGE" | log_cmd gh pr comment "$PR_BRANCH" -F -
-    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+    echo "$MESSAGE" | log_cmd gh pr comment "$PR_NUMBER" -F -
+    log_cmd gh pr edit "$PR_NUMBER" --remove-label "$CONFLICT_LABEL"
 }
 
 # Continue processing after user manually resolved conflicts
 continue_after_resolution() {
     check_env_var "PR_BRANCH"
+    check_env_var "PR_NUMBER"
+    check_env_var "PR_BASE"
+    check_env_var "GITHUB_REPOSITORY"
 
-    echo "Checking if $PR_BRANCH needs continuation after conflict resolution..."
+    echo "Checking if PR #$PR_NUMBER ($PR_BRANCH) needs continuation after conflict resolution..."
 
     # Check if the PR has the conflict label
-    if ! pr_has_conflict_label "$PR_BRANCH"; then
+    if ! pr_has_conflict_label "$PR_NUMBER"; then
         echo "✓ $PR_BRANCH does not have conflict label; nothing to do"
         return
     fi
@@ -217,10 +297,10 @@ continue_after_resolution() {
     # Recover them from the marker the squash-merge run left in the conflict
     # comment.
     local MARKER
-    MARKER=$(read_state_marker "$PR_BRANCH")
+    MARKER=$(read_state_marker "$PR_NUMBER")
     if [[ -z "$MARKER" ]]; then
         echo "⚠️ No autorestack state marker on $PR_BRANCH; cannot resume safely. Removing the label."
-        abandon_resume "$PR_BRANCH" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
+        abandon_resume "$PR_NUMBER" "ℹ️ autorestack could not find its state marker on this PR, so it will not update the stack automatically. If this PR still needs its base updated, update its base manually."
         return
     fi
 
@@ -228,17 +308,17 @@ continue_after_resolution() {
     read -r OLD_BASE NEW_TARGET SQUASH_HASH < <(parse_state_marker "$MARKER")
     echo "Recorded state: base=$OLD_BASE target=$NEW_TARGET squash=$SQUASH_HASH"
 
-    # The base we left the PR on while waiting for conflict resolution was the
-    # merged parent branch. If it no longer matches, a human retargeted the PR
-    # (e.g. straight onto the integration branch); we are no longer the authority
-    # on its base, so we step back without touching the branch. This runs before
-    # any mutation: once the base diverges, the recorded target is stale and a
-    # merge built against it would be wrong.
-    local CURRENT_BASE
-    CURRENT_BASE=$(gh pr view "$PR_BRANCH" --json baseRefName --jq '.baseRefName')
-    if [[ "$CURRENT_BASE" != "$OLD_BASE" ]]; then
-        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $CURRENT_BASE); not updating the stack."
-        abandon_resume "$PR_BRANCH" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
+    if [[ -z "$OLD_BASE" || -z "$NEW_TARGET" || -z "$SQUASH_HASH" ]]; then
+        echo "Error: malformed state marker on $PR_BRANCH: $MARKER" >&2
+        exit 1
+    fi
+
+    # The PR was left based on the merged parent branch. If the payload shows a
+    # different base, a human retargeted the PR; the recorded target is stale,
+    # so step back before any mutation.
+    if [[ "$PR_BASE" != "$OLD_BASE" ]]; then
+        echo "⚠️ Base of $PR_BRANCH changed manually ($OLD_BASE -> $PR_BASE); not updating the stack."
+        abandon_resume "$PR_NUMBER" "ℹ️ The base branch of this PR was changed manually, so autorestack stepped back and will not update it automatically."
         return
     fi
 
@@ -248,21 +328,32 @@ continue_after_resolution() {
     # can succeed, so give up cleanly rather than stranding the PR under the label.
     if ! git rev-parse --verify --quiet "origin/$NEW_TARGET" >/dev/null; then
         echo "⚠️ Recorded target branch '$NEW_TARGET' no longer exists; abandoning resume of $PR_BRANCH."
-        abandon_resume "$PR_BRANCH" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
+        abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was being retargeted onto (\`$NEW_TARGET\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
         return
     fi
 
-    # The squash-merge run pushed the base merge and asked the user to resolve the
-    # pre-squash merge, but it never recorded the squash itself. Finish that now:
-    # re-run the same merge sequence as the squash-merge path. With the user's
-    # resolution in place the base merge and pre-squash merge are no-ops; only the
-    # "-s ours" squash record gets applied, keeping the diff against the new base
-    # clean. has_squash_commit makes this idempotent.
+    # Same check for the old base: the resolution command we posted re-parents
+    # against origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
+    # left enabled, or deleted manually) the user cannot resolve and the label would
+    # re-trigger a failing run on every push. Give up cleanly instead.
+    if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
+        echo "⚠️ Recorded base branch '$OLD_BASE' no longer exists; abandoning resume of $PR_BRANCH."
+        abandon_resume "$PR_NUMBER" "ℹ️ The branch this PR was based on (\`$OLD_BASE\`) no longer exists, so autorestack stepped back. If this PR still needs its base updated, update its base manually."
+        return
+    fi
+
+    # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
+    # head now contains the squash commit. Verify that and finalize -- do NOT re-run
+    # the merge. Its forced base is the old parent, where the lines the user just
+    # resolved still differ from the trunk, so a re-merge would re-raise the very
+    # conflict they fixed. A plain ancestry check is all the resume needs.
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
-    MERGED_BRANCH="$OLD_BASE"
-    TARGET_BRANCH="$NEW_TARGET"
-    if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET"; then
-        echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
+    log_cmd git checkout "$PR_BRANCH"
+    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
+        # Fail loudly rather than silently: the user pushed without finishing the
+        # re-parent, so a red run is the signal they need to look again.
+        echo "❌ '$PR_BRANCH' does not contain the squash commit; the conflict is not resolved." >&2
+        echo "   Follow the conflict comment on this PR (run its git-merge-onto command), then push again." >&2
         return 1
     fi
 
@@ -272,8 +363,8 @@ continue_after_resolution() {
     # NEW_TARGET when the base flips to it, keeping the PR mergeable (GitHub
     # suppresses CI on a PR that conflicts with its base).
     log_cmd git push origin "$PR_BRANCH"
-    log_cmd gh pr edit "$PR_BRANCH" --base "$NEW_TARGET"
-    log_cmd gh pr edit "$PR_BRANCH" --remove-label "$CONFLICT_LABEL"
+    log_cmd gh pr edit "$PR_NUMBER" --base "$NEW_TARGET"
+    log_cmd gh pr edit "$PR_NUMBER" --remove-label "$CONFLICT_LABEL"
 
     # Check if old base branch should be deleted
     if has_sibling_conflicts "$OLD_BASE" "$PR_BRANCH"; then
@@ -289,38 +380,77 @@ main() {
     check_env_var "SQUASH_COMMIT"
     check_env_var "MERGED_BRANCH"
     check_env_var "TARGET_BRANCH"
+    check_env_var "PR_NUMBER"
 
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
 
+    # A merge-commit merge does not rewrite history: each child's head already
+    # contains the merged branch's commits, and the merge commit carries them
+    # into TARGET_BRANCH. The heads need no synthetic merge; just retarget the
+    # children and delete the merged branch.
+    if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
+        echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; retargeting children without touching their heads"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
+        done < <(list_child_prs)
+        # Deleting a PR's base branch closes the PR, so the retargets come first.
+        log_cmd git push origin ":$MERGED_BRANCH"
+        return 0
+    fi
+
+    # Rebase merges are not supported: the copies on the target are new
+    # commits, so a child retargeted as-is would show its parent's changes in
+    # its diff, and the squash sequence can raise spurious conflicts against
+    # the intermediate copies. Tell the children and leave everything alone.
+    if is_rebase_merge "$PR_NUMBER"; then
+        echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
+        while read -r NUMBER BRANCH; do
+            [[ -n "$BRANCH" ]] || continue
+            log_cmd gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
+        done < <(list_child_prs)
+        return 0
+    fi
+
     # Find all PRs directly targeting the merged PR's head
-    INITIAL_TARGETS=($(log_cmd gh pr list --base "$MERGED_BRANCH" --json headRefName --jq '.[].headRefName'))
+    INITIAL_NUMBERS=()
+    INITIAL_TARGETS=()
+    while read -r NUMBER BRANCH; do
+        [[ -n "$BRANCH" ]] || continue
+        INITIAL_NUMBERS+=("$NUMBER")
+        INITIAL_TARGETS+=("$BRANCH")
+    done < <(list_child_prs)
 
     # Track successfully updated vs conflicted branches separately
     UPDATED_TARGETS=()
+    UPDATED_NUMBERS=()
     CONFLICTED_TARGETS=()
 
-    for BRANCH in "${INITIAL_TARGETS[@]}"; do
-        if update_direct_target "$BRANCH" "$TARGET_BRANCH"; then
-            UPDATED_TARGETS+=("$BRANCH")
+    for i in "${!INITIAL_TARGETS[@]}"; do
+        if update_direct_target "${INITIAL_TARGETS[$i]}" "$TARGET_BRANCH" "${INITIAL_NUMBERS[$i]}"; then
+            UPDATED_TARGETS+=("${INITIAL_TARGETS[$i]}")
+            UPDATED_NUMBERS+=("${INITIAL_NUMBERS[$i]}")
         else
-            CONFLICTED_TARGETS+=("$BRANCH")
+            CONFLICTED_TARGETS+=("${INITIAL_TARGETS[$i]}")
         fi
     done
 
-    # Only update base branches for successfully updated PRs
-    for BRANCH in "${UPDATED_TARGETS[@]}"; do
-        log_cmd gh pr edit "$BRANCH" --base "$TARGET_BRANCH"
+    # Push the heads before retargeting: a failed push then leaves each PR
+    # intact on its old base, and the head already contains TARGET_BRANCH when
+    # the base flips to it.
+    if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
+        log_cmd git push origin "${UPDATED_TARGETS[@]}"
+    fi
+
+    for NUMBER in "${UPDATED_NUMBERS[@]}"; do
+        log_cmd gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
     done
 
-    # Push updated branches; only delete merged branch if no conflicts
+    # Deleting a PR's base branch closes the PR, so this must come after the
+    # retargets. Keep the branch for reference while conflicted PRs remain.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        # No conflicts - safe to delete merged branch
-        log_cmd git push origin ":$MERGED_BRANCH" "${UPDATED_TARGETS[@]}"
+        log_cmd git push origin ":$MERGED_BRANCH"
     else
-        # Some conflicts - keep merged branch for reference during manual resolution
-        if [[ "${#UPDATED_TARGETS[@]}" -gt 0 ]]; then
-            log_cmd git push origin "${UPDATED_TARGETS[@]}"
-        fi
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi
 }
