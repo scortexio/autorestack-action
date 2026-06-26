@@ -321,9 +321,9 @@ continue_after_resolution() {
         return
     fi
 
-    # Same check for the old base: the resume re-runs git-merge-onto against
-    # origin/$OLD_BASE, so if that branch is gone (auto-delete head branches left
-    # enabled, or deleted manually) it can never resolve and the label would
+    # Same check for the old base: the resolution command we posted re-parents
+    # against origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
+    # left enabled, or deleted manually) the user cannot resolve and the label would
     # re-trigger a failing run on every push. Give up cleanly instead.
     if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
         echo "⚠️ Recorded base branch '$OLD_BASE' no longer exists; abandoning resume of $PR_BRANCH."
@@ -331,16 +331,15 @@ continue_after_resolution() {
         return
     fi
 
-    # The squash-merge run asked the user to resolve the re-parent and recorded the
-    # state, but committed nothing. Re-run the same re-parent now: with the user's
-    # resolution pushed, git-merge-onto is a no-op (the squash is already an
-    # ancestor of the resolved head), so update_direct_target just confirms the
-    # branch and moves on. has_squash_commit makes this idempotent.
+    # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
+    # head now contains the squash commit. Verify that and finalize -- do NOT re-run
+    # the merge. Its forced base is the old parent, where the lines the user just
+    # resolved still differ from the trunk, so a re-merge would re-raise the very
+    # conflict they fixed. A plain ancestry check is all the resume needs.
     log_cmd git update-ref SQUASH_COMMIT "$SQUASH_HASH"
-    MERGED_BRANCH="$OLD_BASE"
-    TARGET_BRANCH="$NEW_TARGET"
-    if ! update_direct_target "$PR_BRANCH" "$NEW_TARGET" "$PR_NUMBER"; then
-        echo "⚠️ '$PR_BRANCH' still conflicts; re-posted the conflict comment, will retry on next push"
+    log_cmd git checkout "$PR_BRANCH"
+    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
+        echo "⚠️ '$PR_BRANCH' does not contain the squash commit yet; resolution incomplete, will retry on next push"
         return 1
     fi
 
