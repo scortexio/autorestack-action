@@ -58,9 +58,12 @@ log_cmd git add file.txt
 log_cmd git commit -m "Add feature 3"
 simulate_push feature3
 
-# Simulate a squash merge of feature1 into main by cherry-picking
+# Simulate a squash merge of feature1 into main by cherry-picking. -x changes
+# the commit message: a plain cherry-pick landing in the same second as the
+# original commit reproduces feature1's sha exactly, and the script then skips
+# the whole re-parenting as already done, silently testing nothing.
 log_cmd git checkout main
-log_cmd git cherry-pick "$FEATURE1_COMMIT" # Apply the changes from feature1's commit
+log_cmd git cherry-pick -x "$FEATURE1_COMMIT"
 # The cherry-pick creates a *new* commit on main, simulating the squash merge result
 SQUASH_COMMIT=$(log_cmd git rev-parse HEAD) # Get the hash of the new commit on main
 simulate_push main # Update origin/main to include the squash commit
@@ -72,7 +75,8 @@ echo "Simulated Squash commit (via cherry-pick): $SQUASH_COMMIT"
 echo "Running update-pr-stack.sh..."
 # The update script sources command_utils.sh itself
 # Capture stdout+stderr interleaved so command ordering can be asserted.
-RUN_LOG="$TEST_REPO/update_run.log"
+# Outside the test repo: an untracked file makes git-merge-onto refuse to run.
+RUN_LOG=$(mktemp)
 run_update_pr_stack() {
   log_cmd \
     env \
