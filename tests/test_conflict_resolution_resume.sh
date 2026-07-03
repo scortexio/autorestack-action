@@ -21,7 +21,7 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 # Build a configurable gh mock in a temp dir. It records every invocation to
 # $CALLS and is driven by env vars set per scenario:
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
-#   MOCK_COMMENTS_FILE  file whose contents are returned by `pr view --json comments`
+#   MOCK_COMMENTS_FILE  file served as the body of our own PR comments
 #   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
 # The PR's base branch is not mocked: the script must take it from PR_BASE
 # (event payload), so a baseRefName query is an unhandled call and fails.
@@ -36,18 +36,18 @@ if [[ "$1 $2" == "pr view" ]]; then
         *--json\ labels*)
             [[ "${MOCK_LABELS_FAIL:-}" == 1 ]] && { echo "mock gh: labels API down" >&2; exit 1; }
             printf '%s\n' "${MOCK_LABELS:-}";;
-        *--json\ comments*)
-            # The comments file stands for our own comments only, so the query
-            # must restrict itself to those.
-            [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
-            cat "${MOCK_COMMENTS_FILE:-/dev/null}";;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
+elif [[ "$1 $2" == "api graphql" ]]; then
+    # The comments file stands for our own comments only, so the query must
+    # restrict itself to those.
+    [[ "$*" == *viewerDidAuthor* ]] || { echo "comments query must filter by viewerDidAuthor" >&2; exit 1; }
+    cat "${MOCK_COMMENTS_FILE:-/dev/null}"
 elif [[ "$1 $2" == "pr comment" ]]; then
     cat >/dev/null  # consume the -F - body
 elif [[ "$1 $2" == "pr edit" ]]; then
     :
-elif [[ "$1 $2" == "pr list" ]]; then
+elif [[ "$1" == "api" ]]; then
     :  # no sibling conflicts
 elif [[ "$1 $2" == "label create" ]]; then
     :
@@ -96,6 +96,7 @@ setup_repo() {
 
 run_resume() {
     env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
+        GITHUB_REPOSITORY=tester/repo \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
         MOCK_LABELS="$MOCK_LABELS" MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
@@ -228,7 +229,7 @@ setup_repo
 # so the label stays on and the next push retries.
 MOCK_LABELS="autorestack-needs-conflict-resolution"
 PR_BASE="parent"
-MOCK_COMMENTS_FILE="$WORK/does-not-exist"   # makes the mock gh fail on pr view --json comments
+MOCK_COMMENTS_FILE="$WORK/does-not-exist"   # makes the mock gh fail on the comments query
 run_resume
 
 grep -q "EXIT=" "$WORK/out.log" || fail "G: run should have failed"
@@ -248,6 +249,7 @@ PR_BASE="parent"
 MOCK_COMMENTS_FILE="$WORK/comments.txt"
 { echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
 run_resume
+MOCK_LABELS_FAIL=""
 
 grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed, not ended green"
 grep -q "remove-label" "$CALLS" && fail "H: label must NOT be touched on an API failure"
