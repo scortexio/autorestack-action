@@ -3,20 +3,14 @@
 # Mock gh CLI for unit tests.
 # Only direct children are queried now (no recursive updates of indirect children).
 
-if [[ "$1" == "pr" && "$2" == "list" ]]; then
+if [[ "$1" == "api" && "$2" == repos/*"/pulls?base="* ]]; then
     if [[ "${MOCK_PR_LIST_FAIL:-}" == 1 ]]; then
         echo "mock gh: pr list API down" >&2
         exit 1
     fi
-    # Parse the --base argument to determine which PRs to return
-    base=""
-    for ((i=1; i<=$#; i++)); do
-        if [[ "${!i}" == "--base" ]]; then
-            next=$((i+1))
-            base="${!next}"
-        fi
-    done
-
+    # Open PRs based on a branch (already --jq filtered to "<number> <head>").
+    base="${2#*pulls\?base=}"
+    base="${base%%&*}"
     if [[ "$base" == "feature1" ]]; then
         # feature2 is a direct child of feature1 (PR #2)
         echo '2 feature2'
