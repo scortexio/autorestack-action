@@ -87,9 +87,6 @@ check_env_var() {
 
 # Check if a branch already has the squash commit merged (squash-merge mode only)
 # Requires SQUASH_COMMIT ref to be set via git update-ref
-#
-# Note: This uses local branch refs. The caller must ensure both branches
-# exist locally before calling (e.g., via git checkout).
 has_squash_commit() {
     local BRANCH="$1"
     local BASE="$2"
@@ -172,12 +169,11 @@ update_direct_target() {
     local BASE_BRANCH="$2"
     local PR_NUMBER="$3"
 
-    # Checkout first to ensure the local branch exists (created from origin if
-    # needed). This allows has_squash_commit to compare local refs, which matters
-    # for testing where the script may run multiple times in the same repo.
     log_cmd git checkout "$BRANCH"
 
-    if has_squash_commit "$BRANCH" "$TARGET_BRANCH"; then
+    # The target branch is never checked out, so it has no local ref, only the
+    # remote-tracking one; a bare $TARGET_BRANCH would not resolve.
+    if has_squash_commit "$BRANCH" "origin/$TARGET_BRANCH"; then
         echo "✓ $BRANCH already up-to-date; skipping"
         return 0
     fi
