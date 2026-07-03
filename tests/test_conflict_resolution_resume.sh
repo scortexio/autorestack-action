@@ -23,6 +23,7 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 #   MOCK_LABELS         newline-separated labels returned by `pr view --json labels`
 #   MOCK_COMMENTS_FILE  file served as the body of our own PR comments
 #   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
+#   MOCK_PR_LIST_FAIL   set to 1 to make `pr list` fail
 # The PR's base branch is not mocked: the script must take it from PR_BASE
 # (event payload), so a baseRefName query is an unhandled call and fails.
 make_mock_gh() {
@@ -48,6 +49,7 @@ elif [[ "$1 $2" == "pr comment" ]]; then
 elif [[ "$1 $2" == "pr edit" ]]; then
     :
 elif [[ "$1" == "api" ]]; then
+    [[ "${MOCK_PR_LIST_FAIL:-}" == 1 ]] && { echo "mock gh: pr list API down" >&2; exit 1; }
     :  # no sibling conflicts
 elif [[ "$1 $2" == "label create" ]]; then
     :
@@ -100,6 +102,7 @@ run_resume() {
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
         MOCK_LABELS="$MOCK_LABELS" MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
+        MOCK_PR_LIST_FAIL="${MOCK_PR_LIST_FAIL:-}" \
         bash "$ROOT_DIR/update-pr-stack.sh" >"$WORK/out.log" 2>&1 || echo "EXIT=$?" >>"$WORK/out.log"
 }
 
@@ -255,6 +258,27 @@ grep -q "EXIT=" "$WORK/out.log" || fail "H: run should have failed, not ended gr
 grep -q "remove-label" "$CALLS" && fail "H: label must NOT be touched on an API failure"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "H: child was pushed"
 ok "H: labels API failure fails the run instead of skipping the resume"
+
+# ---------------------------------------------------------------------------
+echo "### Scenario I: listing sibling conflicts fails -> keep the old base branch"
+setup_repo
+# Same successful-resume setup as scenario C, but the sibling listing that
+# decides whether the old base branch can be deleted fails. Answering "no
+# siblings" there would delete a branch another conflicted PR still needs.
+git -C "$WORK" merge -q --no-edit main
+git -C "$WORK" push -q origin child
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+MOCK_LABELS_FAIL=""
+PR_BASE="parent"
+MOCK_PR_LIST_FAIL=1
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=" "$WORK/out.log" || fail "I: run should have failed"
+git -C "$ORIGIN" rev-parse --verify -q parent >/dev/null || fail "I: old base branch was deleted on an API failure"
+grep -q -- "push origin :parent" "$CALLS" && fail "I: deletion must not be attempted"
+ok "I: sibling-listing API failure keeps the old base branch"
 
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"

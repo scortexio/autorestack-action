@@ -46,6 +46,9 @@ format_state_marker() {
 }
 
 # Echoes the most recent state-marker line found in our PR comments, or nothing.
+# Dies when the comments cannot be read at all: an API failure must not pass
+# for "no marker", which the caller treats as a reason to give up the resume
+# and remove the conflict label for good.
 read_state_marker() {
     local PR_NUMBER="$1"
     local BODIES
@@ -149,9 +152,10 @@ is_rebase_merge() {
 }
 
 # Echoes "<number> <head branch>" for each open PR based on the merged branch.
-# try, not run: callers consume this through a process substitution, which
-# swallows the exit status either way; a die in here would only leave that
-# subshell. Making the callers notice the failure is a separate concern.
+# try, not run: callers run this in a command substitution, where a die would
+# only leave the subshell, so they capture the output and die themselves. An
+# unhandled failure here must not pass for "no children": the caller would
+# then delete the merged branch under the children it never saw.
 list_child_prs() {
     try gh api "repos/{owner}/{repo}/pulls?base=$MERGED_BRANCH&state=open&per_page=100" \
         --paginate --jq '.[] | "\(.number) \(.head.ref)"'
@@ -252,6 +256,8 @@ pr_has_conflict_label() {
 
 # Check if any other PRs with conflict label still depend on a given base branch
 # Returns 0 (true) if siblings exist, 1 (false) if no siblings
+# Dies when the PRs cannot be listed: answering "no siblings" on an API failure
+# makes the caller delete a branch a sibling may still need for its resolution.
 has_sibling_conflicts() {
     local BASE_BRANCH="$1"
     local EXCLUDE_BRANCH="$2"
@@ -259,7 +265,8 @@ has_sibling_conflicts() {
     # Find all open PRs with the conflict label that are based on BASE_BRANCH
     local CONFLICTED_SIBLINGS
     CONFLICTED_SIBLINGS=$(gh api "repos/{owner}/{repo}/pulls?base=$BASE_BRANCH&state=open&per_page=100" \
-        --paginate --jq ".[] | select(any(.labels[]; .name == \"$CONFLICT_LABEL\")) | .head.ref" 2>/dev/null || echo "")
+        --paginate --jq ".[] | select(any(.labels[]; .name == \"$CONFLICT_LABEL\")) | .head.ref") \
+        || die "could not list conflicted PRs based on $BASE_BRANCH"
 
     for SIBLING in $CONFLICTED_SIBLINGS; do
         if [[ "$SIBLING" != "$EXCLUDE_BRANCH" ]]; then
@@ -395,10 +402,11 @@ main() {
     # children and delete the merged branch.
     if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
         echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; retargeting children without touching their heads"
+        CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue
             run gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
-        done < <(list_child_prs)
+        done <<<"$CHILDREN"
         # Deleting a PR's base branch closes the PR, so the retargets come first.
         run git push origin ":$MERGED_BRANCH"
         return 0
@@ -410,21 +418,23 @@ main() {
     # the intermediate copies. Tell the children and leave everything alone.
     if is_rebase_merge "$PR_NUMBER"; then
         echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
+        CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue
             run gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
-        done < <(list_child_prs)
+        done <<<"$CHILDREN"
         return 0
     fi
 
     # Find all PRs directly targeting the merged PR's head
+    CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
     INITIAL_NUMBERS=()
     INITIAL_TARGETS=()
     while read -r NUMBER BRANCH; do
         [[ -n "$BRANCH" ]] || continue
         INITIAL_NUMBERS+=("$NUMBER")
         INITIAL_TARGETS+=("$BRANCH")
-    done < <(list_child_prs)
+    done <<<"$CHILDREN"
 
     # Track successfully updated vs conflicted branches separately
     UPDATED_TARGETS=()

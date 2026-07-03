@@ -212,6 +212,31 @@ else
     exit 1
 fi
 
+# A failed children listing must fail the run before any mutation: silently
+# treating it as "no children" would delete the merged branch under the
+# children it never saw.
+echo -e "\nRunning update script with a failing pr list..."
+FAIL_LOG="$TEST_REPO/update_fail_run.log"
+if log_cmd env \
+    SQUASH_COMMIT=$SQUASH_COMMIT \
+    MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
+    TARGET_BRANCH=main \
+    MOCK_PR_LIST_FAIL=1 \
+    GH="$SCRIPT_DIR/mock_gh.sh" \
+    GIT="$SCRIPT_DIR/mock_git.sh" \
+    $SCRIPT_DIR/../update-pr-stack.sh > "$FAIL_LOG" 2>&1; then
+    echo "❌ run must fail when the children cannot be listed"
+    cat "$FAIL_LOG"
+    exit 1
+fi
+if grep -q "git push origin :feature1" "$FAIL_LOG"; then
+    echo "❌ merged branch must not be deleted when the children cannot be listed"
+    cat "$FAIL_LOG"
+    exit 1
+fi
+echo "✅ Failing pr list fails the run without deleting the merged branch"
+
 echo -e "\nAll tests passed! 🎉"
 
 # Clean up
