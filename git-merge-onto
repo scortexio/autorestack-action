@@ -4,7 +4,7 @@
 # dependencies = []
 # ///
 #
-# Vendored from https://github.com/scortexio/git-merge-onto (v0.1.0): a single
+# Vendored from https://github.com/scortexio/git-merge-onto (v0.2.0): a single
 # zero-dependency file so the action re-parents a branch without a network
 # download. Do not edit here -- change it upstream, publish, and re-sync.
 """git merge-onto: re-parent HEAD onto <new>, dropping <old>.
@@ -21,6 +21,11 @@ its commit (a squash-merge) -- and a plain merge re-applies <old>, often
 conflicting. Too high -- when the new parent transitively contains HEAD's own
 commit (a reorder) -- and a plain merge fast-forwards, silently dropping HEAD's
 change. Forcing the base to merge-base(HEAD, <old>) is correct in both.
+
+With --absorbed, the merge also records <old>'s tip as a parent: an assertion
+that <new> already carries <old>'s changes even though <old> is not its
+ancestor (squash merge, rebase merge, cherry-picks), so git and GitHub treat
+<old> as merged instead of dropped.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "0.1.0"  # vendored snapshot; see the header above
+__version__ = "0.2.0"  # vendored snapshot; see the header above
 
 # Point at a specific git binary (used by the test suite; "git" otherwise).
 GIT = os.environ.get("GIT_MERGE_ONTO_GIT", "git")
@@ -113,11 +118,8 @@ def git_dir() -> Path:
     return Path(git("rev-parse", "--absolute-git-dir"))
 
 
-def worktree_dirty(include_untracked: bool = True) -> bool:
-    args = ["status", "--porcelain"]
-    if not include_untracked:
-        args.append("--untracked-files=no")
-    return bool(git(*args))
+def worktree_dirty() -> bool:
+    return bool(git("status", "--porcelain"))
 
 
 def in_progress_merge() -> bool:
@@ -141,25 +143,31 @@ def blocking_operation() -> str | None:
     return None
 
 
-def setup_merge_markers(theirs: str, message: str, head_tip: str) -> None:
+def setup_merge_markers(merge_parents: list[str], message: str, head_tip: str) -> None:
     """Write the in-progress-merge state `git commit` reads to finalize a merge:
-    parents come from HEAD + MERGE_HEAD, the message from MERGE_MSG."""
+    parents come from HEAD + MERGE_HEAD (one per line), the message from MERGE_MSG."""
     gd = git_dir()
-    (gd / "MERGE_HEAD").write_text(theirs + "\n")
+    (gd / "MERGE_HEAD").write_text("".join(p + "\n" for p in merge_parents))
     (gd / "MERGE_MODE").write_text("")
     (gd / "MERGE_MSG").write_text(message + "\n")
     (gd / "ORIG_HEAD").write_text(head_tip + "\n")
 
 
-def merge_with_base(base: str, theirs: str, message: str) -> bool:
+def merge_with_base(base: str, theirs: str, message: str, extra_parent: str | None = None) -> bool:
     """Merge `theirs` into HEAD as if `base` were the merge base -- a `git merge`
     with a caller-chosen base, the one thing git porcelain cannot do.
 
     Clean -> commits with parents [HEAD, theirs] and returns True. Conflict ->
     leaves the merge in progress (MERGE_HEAD set, conflict markers in the worktree)
     and returns False, so the caller (or a human) resolves and `git commit`s normally.
+
+    `extra_parent` is recorded as an additional parent, on the clean path and the
+    conflict path alike (it rides along in MERGE_HEAD, so the resolver's plain
+    `git commit` picks it up). `git commit` drops any parent that is an ancestor
+    of another, so a redundant extra parent is harmless.
     """
     head_tip = git("rev-parse", "HEAD")
+    merge_parents = [theirs] if extra_parent is None else [theirs, extra_parent]
     # 3-way merge into index+worktree with the merge base forced to `base`.
     rc = git_rc("merge-recursive", base, "--", head_tip, theirs)
     # merge-recursive returns 0 = clean, 1 = content conflict, >1 = it refused to run
@@ -167,17 +175,20 @@ def merge_with_base(base: str, theirs: str, message: str) -> bool:
     # when there is a real merge to finalize; on a refusal, raise so we never fabricate
     # a merge commit or clobber an existing MERGE_HEAD.
     if rc == 0:
-        # A re-parent normally changes the tree; if it doesn't AND `theirs` is already
-        # an ancestor, the merge commit would add nothing (no content, no new ancestor),
-        # so skip it. (Don't skip merely because `theirs` is an ancestor: re-parenting
-        # onto a trunk that is already an ancestor still must drop the old parent's content.)
-        if git("write-tree") == git("rev-parse", "HEAD^{tree}") and git_rc("merge-base", "--is-ancestor", theirs, head_tip) == 0:
+        # A re-parent normally changes the tree; if it doesn't AND every parent to
+        # record is already an ancestor, the merge commit would add nothing (no
+        # content, no new ancestor), so skip it. (Don't skip merely because `theirs`
+        # is an ancestor: re-parenting onto a trunk that is already an ancestor still
+        # must drop the old parent's content.)
+        if git("write-tree") == git("rev-parse", "HEAD^{tree}") and all(
+            git_rc("merge-base", "--is-ancestor", p, head_tip) == 0 for p in merge_parents
+        ):
             return True
-        setup_merge_markers(theirs, message, head_tip)
+        setup_merge_markers(merge_parents, message, head_tip)
         git("commit", "--no-edit")
         return True
     if rc == 1:
-        setup_merge_markers(theirs, message, head_tip)
+        setup_merge_markers(merge_parents, message, head_tip)
         return False
     raise CommandError(
         [GIT, "merge-recursive", base, "--", head_tip, theirs],
@@ -192,10 +203,15 @@ def _resolve_commit(ref: str) -> str | None:
     return rev_parse(ref) or rev_parse(f"origin/{ref}")
 
 
-def merge_onto(new: str, old: str, message: str | None = None) -> bool:
+def merge_onto(new: str, old: str, message: str | None = None, absorbed: bool = False) -> bool:
     """Re-parent HEAD onto `new`, dropping `old`. Returns True on a clean merge
     (committed), False on a conflict (left in progress to resolve and commit).
-    Raises UserError on a precondition failure (dirty tree, bad ref, no ancestor)."""
+    Raises UserError on a precondition failure (dirty tree, bad ref, no ancestor).
+
+    `absorbed` asserts that `new` already carries `old`'s changes without its
+    commits (squash merge, rebase merge, cherry-picks): `old`'s tip is then
+    recorded as an extra parent of the merge, so the result descends from it
+    and git and GitHub treat `old` as merged instead of dropped."""
     # merge-recursive writes straight into the index/worktree, so refuse to run during
     # another git operation or on a dirty tree rather than corrupt either.
     op = blocking_operation()
@@ -215,11 +231,11 @@ def merge_onto(new: str, old: str, message: str | None = None) -> bool:
     if not base:
         raise UserError(f"no common ancestor between HEAD and old parent {old!r}")
     msg = message or f"Merge {new} into HEAD, dropping {old}"
-    return merge_with_base(base, new_sha, msg)
+    return merge_with_base(base, new_sha, msg, extra_parent=old_sha if absorbed else None)
 
 
-def cmd_merge_onto(new: str, old: str, message: str | None) -> int:
-    if merge_onto(new, old, message):
+def cmd_merge_onto(new: str, old: str, message: str | None, absorbed: bool = False) -> int:
+    if merge_onto(new, old, message, absorbed=absorbed):
         print(bold(f"git merge-onto: merged {new} into HEAD, dropping {old}."), file=sys.stderr)
         return 0
     print(
@@ -242,6 +258,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("-m", "--message", help="commit message for a clean merge")
+    p.add_argument(
+        "--absorbed",
+        action="store_true",
+        help=(
+            "assert that <new> already carries <old>'s changes (squash merge, rebase "
+            "merge, cherry-picks): record <old> as an extra parent of the merge, so "
+            "git and GitHub treat <old> as merged instead of dropped"
+        ),
+    )
     p.add_argument("--quiet", action="store_true", help="do not echo executed git commands")
     p.add_argument("--version", action="version", version=f"git-merge-onto {__version__}")
     p.add_argument("new", help="the new parent to merge into HEAD")
@@ -255,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.quiet:
         VERBOSE = False
     try:
-        return cmd_merge_onto(args.new, args.old, args.message)
+        return cmd_merge_onto(args.new, args.old, args.message, args.absorbed)
     except UserError as e:
         print(red(f"git merge-onto: error: {e}"), file=sys.stderr)
         return 2
