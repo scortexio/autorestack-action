@@ -24,8 +24,10 @@ ok() { echo "✅ $1"; PASS=$((PASS+1)); }
 #   MOCK_COMMENTS_FILE  file served as the body of our own PR comments
 #   MOCK_LABELS_FAIL    set to 1 to make `pr view --json labels` fail
 #   MOCK_PR_LIST_FAIL   set to 1 to make `pr list` fail
-# The PR's base branch is not mocked: the script must take it from PR_BASE
-# (event payload), so a baseRefName query is an unhandled call and fails.
+# The resume decision must take the PR's base from PR_BASE (event payload),
+# never from a live baseRefName query; only the served-diff verification at
+# the very end of a successful resume may ask, and by then the PR has been
+# retargeted onto main.
 make_mock_gh() {
     local dir="$1"
     cat > "$dir/mock_gh.sh" <<'EOF'
@@ -37,8 +39,16 @@ if [[ "$1 $2" == "pr view" ]]; then
         *--json\ labels*)
             [[ "${MOCK_LABELS_FAIL:-}" == 1 ]] && { echo "mock gh: labels API down" >&2; exit 1; }
             printf '%s\n' "${MOCK_LABELS:-}";;
+        *--json\ baseRefName*)
+            echo main;;
         *) echo "unhandled pr view: $*" >&2; exit 1;;
     esac
+elif [[ "$1 $2" == "pr diff" ]]; then
+    # The diff GitHub serves for the resumed PR (#5, branch child). Neutral
+    # config so the output has the shape GitHub serves, whatever the test
+    # machine's gitconfig says.
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        git diff origin/main...origin/child
 elif [[ "$1 $2" == "api graphql" ]]; then
     # The comments file stands for our own comments only, so the query must
     # restrict itself to those.
@@ -98,7 +108,7 @@ setup_repo() {
 
 run_resume() {
     env ACTION_MODE=conflict-resolved PR_BRANCH=child PR_NUMBER=5 PR_BASE="$PR_BASE" \
-        GITHUB_REPOSITORY=tester/repo \
+        GITHUB_REPOSITORY=tester/repo VERIFY_POLL_SECONDS=0 \
         GH="$MOCK_DIR/mock_gh.sh" GIT="$MOCK_DIR/mock_git.sh" \
         MOCK_LABELS="$MOCK_LABELS" MOCK_LABELS_FAIL="${MOCK_LABELS_FAIL:-}" \
         MOCK_COMMENTS_FILE="$MOCK_COMMENTS_FILE" CALLS="$CALLS" \
@@ -161,7 +171,8 @@ base_line=$(grep -n -- "--base main" "$CALLS" | head -1 | cut -d: -f1)
 label_line=$(grep -n "remove-label" "$CALLS" | head -1 | cut -d: -f1)
 [[ "$push_line" -lt "$base_line" ]] || fail "C: push must come before base edit"
 [[ "$base_line" -lt "$label_line" ]] || fail "C: base edit must come before label removal"
-ok "C: resume pushes, retargets base, then removes label"
+grep -q "✓ GitHub serves the expected diff for PR #5" "$WORK/out.log" || fail "C: served diff not verified"
+ok "C: resume pushes, retargets base, removes label, verifies the served diff"
 
 # ---------------------------------------------------------------------------
 echo "### Scenario D: recorded target branch is gone -> give up cleanly"

@@ -104,6 +104,16 @@ else
     exit 1
 fi
 
+# The run must end by checking the diff GitHub serves for the retargeted PR
+# against the refs (the mock serves a diff computed from the same refs, so
+# they match).
+if grep -q "✓ GitHub serves the expected diff for PR #2" "$RUN_LOG"; then
+    echo "✅ Served diff verified against the refs"
+else
+    echo "❌ Served-diff verification did not pass"
+    exit 1
+fi
+
 # Verify the results
 cd "$TEST_REPO"
 
@@ -211,6 +221,73 @@ else
     log_cmd git log --graph --oneline --all
     exit 1
 fi
+
+# GitHub sometimes keeps serving a retargeted PR's diff computed against the
+# old base until a fresh event triggers a recompute. The mock simulates it
+# with a countdown file: `pr diff` serves garbage while the file exists, and
+# each `pr edit` decrements it, clearing it at zero. With a count of 1 the
+# initial retarget leaves the diff stale and the verification's nudge (a
+# same-value base edit) heals it.
+echo -e "\nRunning update script with a stale served diff (heals on the nudge)..."
+STALE_FILE="$TEST_REPO/stale_diffs"
+echo 1 > "$STALE_FILE"
+STALE_LOG=$(mktemp)
+log_cmd \
+    env \
+    SQUASH_COMMIT=$SQUASH_COMMIT \
+    MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
+    TARGET_BRANCH=main \
+    MOCK_STALE_DIFFS="$STALE_FILE" \
+    VERIFY_POLL_SECONDS=0 \
+    GH="$SCRIPT_DIR/mock_gh.sh" \
+    GIT="$SCRIPT_DIR/mock_git.sh" \
+    $SCRIPT_DIR/../update-pr-stack.sh 2>&1 | tee "$STALE_LOG"
+
+NUDGES=$(grep -c "Mock: gh pr edit 2 --base main" "$STALE_LOG" || true)
+if [[ "$NUDGES" -eq 2 ]]; then
+    echo "✅ Stale diff nudged with a same-value base edit"
+else
+    echo "❌ Expected the retarget plus one nudge, saw $NUDGES base edits"
+    exit 1
+fi
+if grep -q "✓ GitHub serves the expected diff for PR #2" "$STALE_LOG"; then
+    echo "✅ Stale served diff healed after the nudge"
+else
+    echo "❌ Served diff still unverified after the nudge"
+    exit 1
+fi
+if grep -q "Mock: gh pr comment" "$STALE_LOG"; then
+    echo "❌ No comment must be posted when the nudge heals the diff"
+    exit 1
+fi
+
+# When the staleness survives the nudge and every re-check, the run must warn
+# the user with a PR comment and still end green: the stack update itself
+# succeeded.
+echo -e "\nRunning update script with a served diff that never heals..."
+echo 99 > "$STALE_FILE"
+STUCK_LOG=$(mktemp)
+log_cmd \
+    env \
+    SQUASH_COMMIT=$SQUASH_COMMIT \
+    MERGED_BRANCH=feature1 \
+    PR_NUMBER=1 \
+    TARGET_BRANCH=main \
+    MOCK_STALE_DIFFS="$STALE_FILE" \
+    VERIFY_POLL_SECONDS=0 \
+    GH="$SCRIPT_DIR/mock_gh.sh" \
+    GIT="$SCRIPT_DIR/mock_git.sh" \
+    $SCRIPT_DIR/../update-pr-stack.sh 2>&1 | tee "$STUCK_LOG"
+
+if grep -q "still serves a stale diff for PR #2" "$STUCK_LOG" \
+    && grep -q "Mock: gh pr comment 2" "$STUCK_LOG"; then
+    echo "✅ Persistent staleness warns and comments on the PR without failing the run"
+else
+    echo "❌ Persistent staleness must warn and comment on the PR"
+    exit 1
+fi
+rm -f "$STALE_FILE"
 
 # A failed children listing must fail the run before any mutation: silently
 # treating it as "no children" would delete the merged branch under the

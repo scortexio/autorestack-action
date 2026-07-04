@@ -22,6 +22,7 @@ This action tries to fix that in a transparent way. Install it, and hopefully th
 4. Pushes the updated branches
 5. Updates the direct child PRs to base on trunk now that the bottom change has landed
 6. Deletes the merged branch
+7. Checks that GitHub actually serves each updated PR's diff consistently with the refs. After a base change, GitHub sometimes keeps serving the diff computed against the old base until a fresh event on the PR triggers a recompute, so the "Files changed" tab would durably show the parent's changes. On a mismatch the action re-asserts the PR's current base (a same-value edit that feeds the recompute a fresh event) and re-checks a few times; if the diff stays stale it posts a comment on the PR with the manual fix. This step is advisory and never fails the run.
 
 The re-parent primitive ([git-merge-onto](https://github.com/scortexio/git-merge-onto)) is vendored as a single zero-dependency file and run with `python3`, so the action needs no network download.
 

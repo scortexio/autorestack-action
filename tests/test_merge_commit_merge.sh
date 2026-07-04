@@ -83,6 +83,18 @@ if [[ "$EDIT_LINE" -gt "$DELETE_LINE" ]]; then
     exit 1
 fi
 
+# The served-diff verification is advisory, so it must come after the
+# deletion, the last mutation the run owes the stack.
+VERIFY_LINE=$(grep -n "✓ GitHub serves the expected diff for PR #2" <<<"$OUT" | cut -d: -f1 | head -1 || true)
+if [[ -z "$VERIFY_LINE" ]]; then
+    echo "❌ Served diff must be verified after the retarget"
+    exit 1
+fi
+if [[ "$VERIFY_LINE" -lt "$DELETE_LINE" ]]; then
+    echo "❌ Verification must come after the branch deletion (verify=$VERIFY_LINE delete=$DELETE_LINE)"
+    exit 1
+fi
+
 # The untouched head keeps a clean diff against the new base
 ACTUAL_DIFF=$(git diff main...feature2 | grep '^[+-]' | grep -v '^[+-][+-][+-]')
 if [[ "$ACTUAL_DIFF" != "+f2" ]]; then
