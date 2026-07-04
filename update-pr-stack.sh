@@ -171,6 +171,130 @@ abort_merge_if_in_progress() {
     fi
 }
 
+# GitHub's served diff and a local `git diff` of the same trees agree on
+# content but not on header noise: blob hashes (the index lines) differ
+# between generators, and so can the "diff --git" line's formatting. Drop
+# both, keep everything else verbatim.
+normalize_diff() {
+    sed -e '/^index /d' -e '/^diff --git /d'
+}
+
+# Args: PR number, head branch, base branch. Returns 0 when the diff GitHub
+# serves for the PR matches one computed locally from the remote-tracking
+# refs, 1 when it does not, 2 when a command failed. The local diff pins
+# every config knob that shapes the text, so it reproduces GitHub's generator
+# no matter what the runner's gitconfig says: diff.algorithm (hunk
+# splitting), noprefix/mnemonicPrefix and the explicit --src/dst-prefix (the
+# a/ b/ headers), diff.context (hunk sizes), --no-ext-diff and --no-textconv
+# (content rewriting), --no-color.
+served_diff_matches() {
+    local NUMBER="$1" BRANCH="$2" BASE="$3"
+    local SERVED EXPECTED
+    SERVED=$(try gh pr diff "$NUMBER" | normalize_diff) || return 2
+    EXPECTED=$(try git -c diff.algorithm=myers -c diff.noprefix=false \
+        -c diff.mnemonicPrefix=false -c diff.context=3 \
+        diff --no-color --no-ext-diff --no-textconv \
+        --src-prefix=a/ --dst-prefix=b/ \
+        "origin/$BASE...origin/$BRANCH" | normalize_diff) || return 2
+    [[ "$SERVED" == "$EXPECTED" ]]
+}
+
+# Args: PR number, head branch. A verification step failed; the check is
+# advisory, so tell the log and move on.
+warn_unverified() {
+    echo "⚠️ Could not verify the diff GitHub serves for PR #$1 ($2)" >&2
+}
+
+# Args: PR number, head branch. Advisory check that GitHub actually *serves*
+# the PR's diff consistently with the refs, nudging its recompute when it
+# does not. Always returns 0: the stack update itself is already complete, so
+# a failure here only warns (and comments on the PR when the diff stays
+# stale).
+#
+# Observed repeatedly on real GitHub (scortexio/gh-stack-mv#37 works around
+# the same bug): after `gh pr edit --base`, GitHub sometimes keeps serving
+# the diff computed against the OLD base. The PR record (baseRefName) is
+# correct, only the diff endpoint is stale, and it stays stale until a fresh
+# event on the PR triggers another recompute. The retarget is the last event
+# this action feeds a PR, so left alone the PR's "Files changed" tab durably
+# shows the parent's changes -- the very thing this action exists to prevent.
+verify_pr_diff() {
+    local NUMBER="$1" BRANCH="$2"
+    local BASE RC
+
+    # The base is read LIVE from the PR, never remembered from this run's own
+    # retarget: a human retargeting the PR while this check runs must not
+    # have their edit reverted by the nudge below.
+    BASE=$(try gh pr view "$NUMBER" --json baseRefName --jq .baseRefName) \
+        || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+    # The expected diff is computed from refs fetched at verification time:
+    # the invariant checked is "the served diff is consistent with the refs
+    # as they are NOW", which holds under any concurrent push history.
+    try git fetch origin "refs/heads/$BASE" "refs/heads/$BRANCH" \
+        || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+
+    RC=0; served_diff_matches "$NUMBER" "$BRANCH" "$BASE" || RC=$?
+    if [[ "$RC" -eq 1 ]]; then
+        # A push can land between the fetch above and gh's read, so a single
+        # mismatch may be a torn read, not staleness. Re-fetch and re-compare
+        # once before concluding anything.
+        try git fetch origin "refs/heads/$BASE" "refs/heads/$BRANCH" \
+            || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+        RC=0; served_diff_matches "$NUMBER" "$BRANCH" "$BASE" || RC=$?
+    fi
+
+    if [[ "$RC" -eq 1 ]]; then
+        # Genuinely stale. Nudge: re-assert the base the PR has RIGHT NOW (a
+        # same-value edit); its only purpose is to feed the diff recompute a
+        # fresh event. Re-read rather than reuse: never write a value that
+        # was not on the PR moments before.
+        BASE=$(try gh pr view "$NUMBER" --json baseRefName --jq .baseRefName) \
+            || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+        try gh pr edit "$NUMBER" --base "$BASE" \
+            || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+        for _ in $(seq 1 5); do
+            sleep "${VERIFY_POLL_SECONDS:-3}"
+            # A concurrent push during this window would otherwise keep
+            # reading as "still stale": keep the expected diff in step with
+            # the refs.
+            try git fetch origin "refs/heads/$BASE" "refs/heads/$BRANCH" \
+                || { warn_unverified "$NUMBER" "$BRANCH"; return 0; }
+            RC=0; served_diff_matches "$NUMBER" "$BRANCH" "$BASE" || RC=$?
+            [[ "$RC" -eq 1 ]] || break
+        done
+    fi
+
+    case "$RC" in
+        0)
+            echo "✓ GitHub serves the expected diff for PR #$NUMBER"
+            ;;
+        1)
+            echo "⚠️ GitHub still serves a stale diff for PR #$NUMBER ($BRANCH) after a nudge" >&2
+            {
+                echo "### ⚠️ GitHub may be showing an outdated diff"
+                echo
+                echo "After the base branch of this pull request was updated, the diff GitHub serves for it still does not match \`$BASE...$BRANCH\`, and re-asserting the base branch did not refresh it. If the *Files changed* tab looks wrong, nudge the recompute again:"
+                echo '```bash'
+                echo "gh pr edit $NUMBER --base $BASE"
+                echo '```'
+            } | try gh pr comment "$NUMBER" -F - \
+                || echo "⚠️ Could not comment on PR #$NUMBER" >&2
+            ;;
+        *)
+            warn_unverified "$NUMBER" "$BRANCH"
+            ;;
+    esac
+    return 0
+}
+
+# Args: PR number and head branch, repeated (N1 BRANCH1 N2 BRANCH2 ...).
+verify_pr_diffs() {
+    while (( $# >= 2 )); do
+        verify_pr_diff "$1" "$2"
+        shift 2
+    done
+}
+
 # Args: head branch, base branch, PR number. git commands use the branch; gh
 # commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
@@ -385,6 +509,9 @@ continue_after_resolution() {
         echo "Deleting old base branch '$OLD_BASE' (no other PRs depend on it)"
         try git push origin ":$OLD_BASE" || echo "⚠️ Could not delete '$OLD_BASE' (may already be deleted)"
     fi
+
+    # Advisory, so strictly after every mutation the stack is owed.
+    verify_pr_diffs "$PR_NUMBER" "$PR_BRANCH"
 }
 
 main() {
@@ -403,12 +530,18 @@ main() {
     if git rev-parse --verify --quiet SQUASH_COMMIT^2 >/dev/null; then
         echo "✓ '$MERGED_BRANCH' was merged with a merge commit, not squashed; retargeting children without touching their heads"
         CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
+        VERIFY_ARGS=()
         while read -r NUMBER BRANCH; do
             [[ -n "$BRANCH" ]] || continue
             run gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
+            VERIFY_ARGS+=("$NUMBER" "$BRANCH")
         done <<<"$CHILDREN"
         # Deleting a PR's base branch closes the PR, so the retargets come first.
         run git push origin ":$MERGED_BRANCH"
+        # Advisory, so strictly after every mutation the stack is owed.
+        if [[ "${#VERIFY_ARGS[@]}" -gt 0 ]]; then
+            verify_pr_diffs "${VERIFY_ARGS[@]}"
+        fi
         return 0
     fi
 
@@ -467,6 +600,15 @@ main() {
         run git push origin ":$MERGED_BRANCH"
     else
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
+    fi
+
+    # Advisory, so strictly after every mutation the stack is owed.
+    VERIFY_ARGS=()
+    for i in "${!UPDATED_NUMBERS[@]}"; do
+        VERIFY_ARGS+=("${UPDATED_NUMBERS[$i]}" "${UPDATED_TARGETS[$i]}")
+    done
+    if [[ "${#VERIFY_ARGS[@]}" -gt 0 ]]; then
+        verify_pr_diffs "${VERIFY_ARGS[@]}"
     fi
 }
 
