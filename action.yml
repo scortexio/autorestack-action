@@ -1,5 +1,5 @@
 name: 'Stacked PR Update Action'
-description: 'Automatically fixes stacked PRs after a base PR is squash-merged'
+description: 'Automatically fixes stacked PRs after a base PR is squash- or rebase-merged'
 author: 'GitHub Actions'
 
 inputs:

@@ -20,7 +20,7 @@ jobs:
           bash tests/test_conflict_resolution_resume.sh
           bash tests/test_conflict_absorbed_resolution.sh
           bash tests/test_merge_commit_merge.sh
-          bash tests/test_rebase_merge_skip.sh
+          bash tests/test_rebase_merge.sh
 
   e2e-tests:
     name: E2E Tests
