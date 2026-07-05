@@ -167,31 +167,44 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # state so the next push can resume. The label comes last: it is what
     # re-triggers us.
     #
+    # The resolution runs in two steps: merge the updated base branch, then
+    # re-home onto the target dropping the base. Splitting it keeps each conflict
+    # its own kind -- the child's changes against its moved parent, then against
+    # the trunk -- instead of one merge that conflates both.
+    #
     # The resume rides on a synchronize event, and GitHub creates no pull_request
     # runs for a PR that conflicts with its base. This PR's base is the merged
     # branch (kept until the resume retargets it), and the head does not always
     # descend from its tip: when an earlier run updated that branch after this
     # head forked (an ancestor PR merged first), GitHub falls back to a textual
     # merge to decide mergeability, which fails exactly when the resolution
-    # rewrote the same lines. That would strand the PR: no run, label stuck.
-    # --absorbed in the posted command is what prevents this: it records the
-    # merged branch's tip as a parent of the resolution, so the pushed head
-    # descends from its base again and the resume event is guaranteed to fire.
+    # rewrote the same lines. That would strand the PR: no run, label stuck. The
+    # first step, `git merge origin/$MERGED_BRANCH`, is what prevents this: it
+    # lands the merged branch's tip in the resolved head's ancestry (the re-home
+    # keeps it as a parent), so the pushed head descends from its base again and
+    # the resume event is guaranteed to fire.
     abort_merge_if_in_progress
     local SQUASH_HASH_FOR_MARKER
     SQUASH_HASH_FOR_MARKER=$(git rev-parse SQUASH_COMMIT) || die "cannot resolve SQUASH_COMMIT"
     {
         echo "### ⚠️ Automatic update blocked by a merge conflict"
         echo
-        echo "Resolve it like this:"
+        echo "Resolve it in two steps. First merge the updated base branch:"
         echo '```bash'
         echo "git fetch origin"
         echo "git switch $BRANCH"
         echo "git merge --ff-only origin/$BRANCH"
-        echo "uvx 'git-merge-onto>=0.2' --absorbed origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo "git merge origin/$MERGED_BRANCH"
         echo '```'
         echo
-        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
+        echo 'Fix any conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
+        echo
+        echo "Then re-home the branch onto \`$BASE_BRANCH\`, dropping \`$MERGED_BRANCH\`:"
+        echo '```bash'
+        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo '```'
+        echo
+        echo 'Fix any conflicts, then run `git add -A && git commit` to finish the merge.'
         echo
         echo '```bash'
         echo "git push origin $BRANCH"
@@ -306,8 +319,8 @@ continue_after_resolution() {
         return
     fi
 
-    # Same check for the old base: the resolution command we posted re-parents
-    # against origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
+    # Same check for the old base: both resolution commands we posted reference
+    # origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
     # left enabled, or deleted manually) the user cannot resolve and the label would
     # re-trigger a failing run on every push. Give up cleanly instead.
     if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
@@ -316,18 +329,18 @@ continue_after_resolution() {
         return
     fi
 
-    # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
-    # head now contains the squash commit. Verify that and finalize -- do NOT re-run
-    # the merge. Its forced base is the old parent, where the lines the user just
-    # resolved still differ from the trunk, so a re-merge would re-raise the very
-    # conflict they fixed. A plain ancestry check is all the resume needs.
+    # The user resolved by re-homing onto the target (the comment's `git-merge-onto`
+    # step), so the head now contains the squash commit. Verify that and finalize --
+    # do NOT re-run the merge. Its forced base is the old parent, where the lines the
+    # user just resolved still differ from the trunk, so a re-merge would re-raise the
+    # very conflict they fixed. A plain ancestry check is all the resume needs.
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
     if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
         # Fail loudly rather than silently: the user pushed without finishing the
         # re-parent, so a red run is the signal they need to look again.
         echo "❌ '$PR_BRANCH' does not contain the squash commit; the conflict is not resolved." >&2
-        echo "   Follow the conflict comment on this PR (run its git-merge-onto command), then push again." >&2
+        echo "   Follow the conflict comment on this PR (run its two resolution steps), then push again." >&2
         return 1
     fi
 
