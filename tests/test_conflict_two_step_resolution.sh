@@ -9,16 +9,16 @@
 #      feature2.
 #   2. feature1 is squash-merged; the action's re-parent of feature2 conflicts,
 #      so the action posts the resolution comment and stops.
-#   3. The user resolves in two steps: `git merge origin/feature1` to catch up
-#      to the moved base, then `git-merge-onto origin/main origin/feature1` to
-#      re-home onto the trunk.
+#   3. The user resolves with two plain merges: `git merge origin/feature1` to
+#      catch up to the moved base, then `git merge origin/main` to bring in the
+#      target. No git-merge-onto, no --absorbed.
 #
 # The resolution must descend from origin/feature1's tip: feature2's PR is
 # still based on feature1 at that point, and GitHub creates no pull_request
 # runs for a PR that conflicts with its base, so without that ancestry the
 # resume event may never fire and the conflict label stays stuck forever. The
-# first step is what provides it -- it lands feature1's tip in the head's
-# ancestry, and the re-home keeps it as a parent, so no --absorbed is needed.
+# first merge is what provides it -- it lands feature1's tip in the head's
+# ancestry, which the second merge keeps, so no re-parent is needed.
 
 set -ueo pipefail
 
@@ -111,20 +111,21 @@ if ! grep -qF "git merge origin/feature1" "$COMMENT_FILE"; then
     cat "$COMMENT_FILE"
     exit 1
 fi
-if ! grep -qF "git-merge-onto origin/main origin/feature1" "$COMMENT_FILE"; then
-    echo "❌ The posted resolution must re-home onto the target branch"
+if ! grep -qF "git merge origin/main" "$COMMENT_FILE"; then
+    echo "❌ The posted resolution must merge the target branch"
     cat "$COMMENT_FILE"
     exit 1
 fi
-if grep -qF -- "--absorbed" "$COMMENT_FILE"; then
-    echo "❌ The posted resolution must not use --absorbed"
+if grep -qF "git-merge-onto" "$COMMENT_FILE"; then
+    echo "❌ The posted resolution must be plain git, with no git-merge-onto"
     cat "$COMMENT_FILE"
     exit 1
 fi
 echo "✅ Conflict detected: two-step resolution comment posted, stack left alone"
 
-# Resolve as the comment instructs. Step 1: merge the moved base branch. Both
-# sides rewrote line 2, so this conflicts; resolve to feature2's content.
+# Resolve as the comment instructs, with two plain merges. Step 1: merge the
+# moved base branch. Both sides rewrote line 2, so this conflicts; resolve to
+# feature2's content.
 log_cmd git checkout feature2
 if log_cmd git merge --no-edit origin/feature1; then
     echo "❌ The base merge should conflict (both sides rewrote line 2)"
@@ -134,17 +135,21 @@ sed -i '/^<<<<<<</,/^>>>>>>>/c\Feature 2 version' file.txt
 log_cmd git add file.txt
 log_cmd git commit --no-edit
 
-# Step 2: re-home onto main, dropping feature1. The vendored copy stands in for
-# `uvx git-merge-onto` (unit tests have no network). feature1's changes now live
-# on main via the squash, so re-homing is clean here.
-if ! python3 "$SCRIPT_DIR/../git-merge-onto" origin/main origin/feature1; then
-    echo "❌ The re-home left a conflict; expected it to be clean after step 1"
+# Step 2: merge the target branch. feature2 rewrote the same line 2 that the
+# squash reshaped, so with the plain merge's true base (before feature1 existed)
+# this raises the conflict a second time -- the price of a re-parent-free recipe
+# when the child edits its parent's lines. Resolve it again.
+if log_cmd git merge --no-edit origin/main; then
+    echo "❌ The target merge should conflict (feature2 vs main both rewrote line 2)"
     exit 1
 fi
+sed -i '/^<<<<<<</,/^>>>>>>>/c\Feature 2 version' file.txt
+log_cmd git add file.txt
+log_cmd git commit --no-edit
 simulate_push feature2
 
-# The regression assertion: the resolution descends from the old base's tip,
-# provided by step 1's merge (no --absorbed).
+# The regression assertion: the resolution still descends from the old base's
+# tip, provided by step 1's merge (no --absorbed, no re-parent).
 if log_cmd git merge-base --is-ancestor "$FEATURE1_TIP" feature2; then
     echo "✅ Resolution descends from origin/feature1's tip (step-1 merge recorded it)"
 else

@@ -167,10 +167,13 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # state so the next push can resume. The label comes last: it is what
     # re-triggers us.
     #
-    # The resolution runs in two steps: merge the updated base branch, then
-    # re-home onto the target dropping the base. Splitting it keeps each conflict
-    # its own kind -- the child's changes against its moved parent, then against
-    # the trunk -- instead of one merge that conflates both.
+    # The resolution is two plain merges: the updated base branch, then the
+    # target. The target already carries the merged branch's content (the squash
+    # commit, or the rebase copies), so once the head contains the target the
+    # retargeted diff shows only the child's own changes -- no re-parent needed
+    # to drop the base. Both commands name branch tips, never the squash commit
+    # or its parent, so nothing here depends on whether the branch was squash- or
+    # rebase-merged.
     #
     # The resume rides on a synchronize event, and GitHub creates no pull_request
     # runs for a PR that conflicts with its base. This PR's base is the merged
@@ -179,10 +182,10 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # head forked (an ancestor PR merged first), GitHub falls back to a textual
     # merge to decide mergeability, which fails exactly when the resolution
     # rewrote the same lines. That would strand the PR: no run, label stuck. The
-    # first step, `git merge origin/$MERGED_BRANCH`, is what prevents this: it
-    # lands the merged branch's tip in the resolved head's ancestry (the re-home
-    # keeps it as a parent), so the pushed head descends from its base again and
-    # the resume event is guaranteed to fire.
+    # first merge, `git merge origin/$MERGED_BRANCH`, is what prevents this: it
+    # lands the merged branch's tip in the resolved head's ancestry, so the
+    # pushed head descends from its base again and the resume event is
+    # guaranteed to fire.
     abort_merge_if_in_progress
     local SQUASH_HASH_FOR_MARKER
     SQUASH_HASH_FOR_MARKER=$(git rev-parse SQUASH_COMMIT) || die "cannot resolve SQUASH_COMMIT"
@@ -199,9 +202,9 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         echo
         echo 'Fix any conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
         echo
-        echo "Then re-home the branch onto \`$BASE_BRANCH\`, dropping \`$MERGED_BRANCH\`:"
+        echo "Then merge the target branch \`$BASE_BRANCH\`:"
         echo '```bash'
-        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo "git merge origin/$BASE_BRANCH"
         echo '```'
         echo
         echo 'Fix any conflicts, then run `git add -A && git commit` to finish the merge.'
@@ -329,11 +332,11 @@ continue_after_resolution() {
         return
     fi
 
-    # The user resolved by re-homing onto the target (the comment's `git-merge-onto`
-    # step), so the head now contains the squash commit. Verify that and finalize --
-    # do NOT re-run the merge. Its forced base is the old parent, where the lines the
-    # user just resolved still differ from the trunk, so a re-merge would re-raise the
-    # very conflict they fixed. A plain ancestry check is all the resume needs.
+    # The user resolved by merging the target branch (the comment's second step),
+    # so the head now contains the squash commit. Verify that and finalize -- do
+    # NOT re-run the merge. The lines the user just resolved would conflict again
+    # against the same refs, so a re-merge would re-raise the very conflict they
+    # fixed. A plain ancestry check is all the resume needs.
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
     if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then

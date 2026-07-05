@@ -275,9 +275,9 @@ get_conflict_comment() {
     printf '%s\n' "$comment"
 }
 
-# The conflict comment must tell the user to resolve in two steps: first
-# `git merge origin/<merged branch>` to catch up to the moved base, then
-# `uvx git-merge-onto origin/<target> origin/<merged branch>` to re-home.
+# The conflict comment must tell the user to resolve with two plain merges:
+# first `git merge origin/<merged branch>` to catch up to the moved base, then
+# `git merge origin/<target>` to bring in the target. No git-merge-onto.
 assert_conflict_comment_reparent() {
     local comment=$1
     local target=$2
@@ -289,13 +289,19 @@ assert_conflict_comment_reparent() {
         echo >&2 "$comment"
         exit 1
     fi
-    if ! echo "$comment" | grep -qxF "uvx git-merge-onto origin/$target origin/$merged"; then
-        echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx git-merge-onto origin/$target origin/$merged'."
+    if ! echo "$comment" | grep -qxF "git merge origin/$target"; then
+        echo >&2 "❌ Verification Failed: conflict comment lacks 'git merge origin/$target'."
         echo >&2 "--- Full comment ---"
         echo >&2 "$comment"
         exit 1
     fi
-    echo >&2 "✅ Verification Passed: conflict comment re-parents origin/$merged onto origin/$target in two steps."
+    if echo "$comment" | grep -qF "git-merge-onto"; then
+        echo >&2 "❌ Verification Failed: conflict comment must be plain git, with no git-merge-onto."
+        echo >&2 "--- Full comment ---"
+        echo >&2 "$comment"
+        exit 1
+    fi
+    echo >&2 "✅ Verification Passed: conflict comment merges origin/$merged then origin/$target."
 }
 
 follow_conflict_comment() {
@@ -1042,9 +1048,9 @@ fi
 
 # The re-parent is one atomic merge, so on a conflict the action commits and
 # pushes nothing: origin/feature3 must still sit at its pre-conflict head. The
-# resume is guaranteed by the resolution itself: its first step,
+# resume is guaranteed by the resolution itself: its first merge,
 # `git merge origin/feature2`, lands origin/feature2's tip in the head's
-# ancestry (the re-home keeps it as a parent), so the pushed head descends from
+# ancestry (the second merge keeps it), so the pushed head descends from
 # its base and GitHub creates the synchronize run (it creates none for a PR that
 # conflicts with its base). Asserted after the resolution below.
 REMOTE_FEATURE3_SHA_BEFORE_RESOLVE=$(log_cmd git rev-parse "refs/remotes/origin/feature3")
@@ -1064,10 +1070,9 @@ echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
 log_cmd git fetch origin
 FEATURE2_TIP_AT_RESOLUTION=$(log_cmd git rev-parse "refs/remotes/origin/feature2")
 # Follow the comment exactly: fetch, fast-forward to origin/feature3, merge the
-# moved base, re-home onto main (uvx git-merge-onto), resolve the conflict, and
-# push. Following it must leave feature3 cleanly mergeable into its new base, or
-# the synchronize-triggered continuation can never make progress and the
-# conflict label stays stuck.
+# moved base, merge main, resolve the conflict, and push. Following it must leave
+# feature3 cleanly mergeable into its new base, or the synchronize-triggered
+# continuation can never make progress and the conflict label stays stuck.
 follow_conflict_comment "$CONFLICT_COMMENT" file.txt "feature3" 1
 echo >&2 "Resolved file.txt content:"
 cat file.txt
