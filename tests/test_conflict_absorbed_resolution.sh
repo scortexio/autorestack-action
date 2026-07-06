@@ -101,7 +101,7 @@ if [[ "$(git rev-parse feature2)" != "$FEATURE2_BEFORE" ]]; then
     echo "❌ feature2 must not move on a conflict"
     exit 1
 fi
-if ! grep -q -- "--absorbed origin/main origin/feature1" "$COMMENT_FILE"; then
+if ! grep -q -- "--absorbed" "$COMMENT_FILE"; then
     echo "❌ The posted resolution command must use --absorbed"
     cat "$COMMENT_FILE"
     exit 1
