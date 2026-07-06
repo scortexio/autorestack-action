@@ -22,6 +22,11 @@ elif [[ "$1" == "pr" && "$2" == "edit" ]]; then
     # Just log the edit command
     echo "Mock: gh pr edit $3 --base $5"
 elif [[ "$1" == "pr" && "$2" == "comment" ]]; then
+    # Consume the body when it comes on stdin (-F -); keep a copy for tests
+    # that assert on the comment's content.
+    if [[ " $* " == *" -F "* ]]; then
+        cat > "${MOCK_COMMENT_FILE:-/dev/null}"
+    fi
     # Just log the comment command
     echo "Mock: gh pr comment $3"
 elif [[ "$1" == "api" && "$2" == repos/*/commits/*/pulls ]]; then

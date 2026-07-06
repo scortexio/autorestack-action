@@ -276,16 +276,16 @@ get_conflict_comment() {
 }
 
 # The conflict comment must tell the user to run the re-parent the action tried:
-# a single `uvx git-merge-onto origin/<target> origin/<merged branch>`.
+# a single `uvx git-merge-onto --absorbed origin/<target> origin/<merged branch>`.
 assert_conflict_comment_reparent() {
     local comment=$1
     local target=$2
     local merged=$3
 
-    if echo "$comment" | grep -qxF "uvx git-merge-onto origin/$target origin/$merged"; then
+    if echo "$comment" | grep -qxF "uvx git-merge-onto origin/$target origin/$merged --absorbed"; then
         echo >&2 "✅ Verification Passed: conflict comment re-parents origin/$merged onto origin/$target."
     else
-        echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx git-merge-onto origin/$target origin/$merged'."
+        echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx git-merge-onto origin/$target origin/$merged --absorbed'."
         echo >&2 "--- Full comment ---"
         echo >&2 "$comment"
         exit 1
@@ -1035,9 +1035,11 @@ else
 fi
 
 # The re-parent is one atomic merge, so on a conflict the action commits and
-# pushes nothing: origin/feature3 must still sit at its pre-conflict head. That
-# unchanged head stays a descendant of its base (feature2), so the PR is mergeable
-# and the synchronize event that resumes the action keeps firing.
+# pushes nothing: origin/feature3 must still sit at its pre-conflict head. The
+# resume is guaranteed by the resolution itself: its --absorbed re-parent records
+# origin/feature2's tip as a parent, so the pushed head descends from its base
+# and GitHub creates the synchronize run (it creates none for a PR that
+# conflicts with its base). Asserted after the resolution below.
 REMOTE_FEATURE3_SHA_BEFORE_RESOLVE=$(log_cmd git rev-parse "refs/remotes/origin/feature3")
 if [[ "$REMOTE_FEATURE3_SHA_BEFORE_RESOLVE" == "$FEATURE3_CONFLICT_COMMIT_SHA" ]]; then
     echo >&2 "✅ Verification Passed: action pushed nothing on the conflict; origin/feature3 is unchanged."
@@ -1050,6 +1052,10 @@ fi
 
 # 12. Resolve the conflict by following the comment the action posted.
 echo >&2 "12. Resolving conflict on feature3 by following the posted comment..."
+# Record the base branch's tip now: the resume deletes feature2, and step 15
+# asserts the resolution descends from this tip.
+log_cmd git fetch origin
+FEATURE2_TIP_AT_RESOLUTION=$(log_cmd git rev-parse "refs/remotes/origin/feature2")
 # Follow the comment exactly: fetch, fast-forward to origin/feature3, run the
 # re-parent (uvx git-merge-onto), resolve the conflict, and push. Following it
 # must leave feature3 cleanly mergeable into its new base, or the
@@ -1116,6 +1122,17 @@ if log_cmd git merge-base --is-ancestor origin/main feature3; then
 else
     echo >&2 "❌ Verification Failed: Resolved feature3 does not include main."
     log_cmd git log --graph --oneline feature3 origin/main
+    exit 1
+fi
+
+# Verify the --absorbed re-parent recorded the old base's tip as a parent. This
+# is the structural guarantee that PR3, still based on feature2 when the
+# resolution was pushed, read as mergeable so GitHub created the resume run.
+if log_cmd git merge-base --is-ancestor "$FEATURE2_TIP_AT_RESOLUTION" feature3; then
+    echo >&2 "✅ Verification Passed: Resolved feature3 descends from feature2's tip (--absorbed)."
+else
+    echo >&2 "❌ Verification Failed: Resolved feature3 does not descend from feature2's tip ($FEATURE2_TIP_AT_RESOLUTION)."
+    log_cmd git log --graph --oneline feature3
     exit 1
 fi
 

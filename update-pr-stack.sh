@@ -200,9 +200,12 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # commit with the base forced to merge-base(HEAD, origin/$MERGED_BRANCH). That
     # drops the merged branch's content (now carried by the target via the squash)
     # while keeping the child's own changes -- the merge equivalent of
-    # `git rebase --onto`, done by the vendored git-merge-onto.
+    # `git rebase --onto`, done by the vendored git-merge-onto. --absorbed records
+    # the merged branch's tip as an extra parent: the head then still descends
+    # from its current base (the merged branch) even when that base moved after
+    # the head forked, so the PR reads as mergeable until it is retargeted.
     local RC=0
-    try python3 "$SCRIPT_DIR/git-merge-onto" -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
+    try python3 "$SCRIPT_DIR/git-merge-onto" --absorbed -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
     if [[ "$RC" -eq 0 ]]; then
         return 0
     fi
@@ -211,10 +214,20 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     fi
 
     # Conflict (exit 1): git-merge-onto committed nothing and left the merge in
-    # progress, so the head is unchanged and still a descendant of its base -- the
-    # PR stays mergeable and the synchronize event that resumes this action keeps
-    # firing. Clean the runner's tree, ask the user to resolve, and record the state
-    # so the next push can resume. The label comes last: it is what re-triggers us.
+    # progress. Clean the runner's tree, ask the user to resolve, and record the
+    # state so the next push can resume. The label comes last: it is what
+    # re-triggers us.
+    #
+    # The resume rides on a synchronize event, and GitHub creates no pull_request
+    # runs for a PR that conflicts with its base. This PR's base is the merged
+    # branch (kept until the resume retargets it), and the head does not always
+    # descend from its tip: when an earlier run updated that branch after this
+    # head forked (an ancestor PR merged first), GitHub falls back to a textual
+    # merge to decide mergeability, which fails exactly when the resolution
+    # rewrote the same lines. That would strand the PR: no run, label stuck.
+    # --absorbed in the posted command is what prevents this: it records the
+    # merged branch's tip as a parent of the resolution, so the pushed head
+    # descends from its base again and the resume event is guaranteed to fire.
     abort_merge_if_in_progress
     local SQUASH_HASH_FOR_MARKER
     SQUASH_HASH_FOR_MARKER=$(git rev-parse SQUASH_COMMIT) || die "cannot resolve SQUASH_COMMIT"
@@ -226,7 +239,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         echo "git fetch origin"
         echo "git switch $BRANCH"
         echo "git merge --ff-only origin/$BRANCH"
-        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH --absorbed"
         echo '```'
         echo
         echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
