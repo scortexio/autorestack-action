@@ -239,7 +239,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         echo "git fetch origin"
         echo "git switch $BRANCH"
         echo "git merge --ff-only origin/$BRANCH"
-        echo "uvx 'git-merge-onto>=0.2' --absorbed origin/$BASE_BRANCH origin/$MERGED_BRANCH"
+        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH --absorbed"
         echo '```'
         echo
         echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
