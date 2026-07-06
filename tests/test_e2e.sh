@@ -282,7 +282,7 @@ assert_conflict_comment_reparent() {
     local target=$2
     local merged=$3
 
-    if echo "$comment" | grep -qxF "uvx 'git-merge-onto>=0.2' --absorbed origin/$target origin/$merged"; then
+    if echo "$comment" | grep -qxF "uvx git-merge-onto origin/$target origin/$merged --absorbed"; then
         echo >&2 "✅ Verification Passed: conflict comment re-parents origin/$merged onto origin/$target."
     else
         echo >&2 "❌ Verification Failed: conflict comment lacks 'uvx 'git-merge-onto>=0.2' --absorbed origin/$target origin/$merged'."
