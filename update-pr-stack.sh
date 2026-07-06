@@ -3,7 +3,8 @@
 # Updates PR stack after merging a PR
 #
 # Required environment variables (squash-merge mode):
-# SQUASH_COMMIT - The hash of the squash commit that was merged
+# SQUASH_COMMIT - The merged PR's merge_commit_sha: the squash commit, or the
+#                 last copied commit of a rebase merge
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
 # TARGET_BRANCH - The name of the branch that the PR was merged into
 # PR_NUMBER - The number of the PR that was merged
@@ -97,58 +98,6 @@ has_squash_commit() {
     local BASE="$2"
     git merge-base --is-ancestor "$BASE" "$BRANCH" \
         && git merge-base --is-ancestor SQUASH_COMMIT "$BRANCH"
-}
-
-# Args: a commit sha. Echoes the numbers of the pull requests that introduced
-# the commit to the repository, one per line.
-commit_pull_numbers() {
-    gh api "repos/{owner}/{repo}/commits/$1/pulls" --jq '.[].number' \
-        || { echo "❌ Could not list the pull requests that introduced commit $1" >&2; return 1; }
-}
-
-# Args: the merge commit sha, the merged PR's number. The association is
-# computed asynchronously, some time after the merge. The merge commit always
-# belongs to the merged PR, so once it shows up the index has caught up with
-# this merge; until then, an empty answer for any commit of the merge means
-# nothing. Exits if the association never appears.
-wait_for_pull_association() {
-    local MERGE_SHA="$1" PR_NUMBER="$2"
-    local NUMBERS
-    for _ in $(seq 1 24); do
-        NUMBERS=$(commit_pull_numbers "$MERGE_SHA") || exit 1
-        if grep -qx "$PR_NUMBER" <<<"$NUMBERS"; then
-            return 0
-        fi
-        sleep "${ASSOCIATION_POLL_SECONDS:-5}"
-    done
-    echo "❌ GitHub never associated $MERGE_SHA with PR #$PR_NUMBER; cannot tell a squash from a rebase" >&2
-    exit 1
-}
-
-# Args: the merged PR's number. The event payload does not say which merge
-# method was used (GitHub records it nowhere), but GitHub associates every
-# trunk commit with the PR that introduced it. A squash introduces a single
-# commit, so the commit below SQUASH_COMMIT belongs to an older PR or to
-# none; a rebase introduces a copy of each PR commit, so with two or more
-# commits the one below SQUASH_COMMIT still belongs to this PR. A
-# single-commit PR merges identically under rebase and squash and correctly
-# reads as a squash here.
-is_rebase_merge() {
-    local PR_NUMBER="$1"
-    local MERGE_SHA PARENT_SHA NUMBERS
-    MERGE_SHA=$(git rev-parse SQUASH_COMMIT)
-    PARENT_SHA=$(git rev-parse SQUASH_COMMIT~)
-
-    NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
-    if [[ -z "$NUMBERS" ]]; then
-        # Ambiguous: "no PR introduced this commit" (a squash on top of a
-        # direct push) and "not indexed yet" (a rebase copy) both come back
-        # empty. Wait until the index has caught up with this merge, then ask
-        # again; this time empty really means no PR.
-        wait_for_pull_association "$MERGE_SHA" "$PR_NUMBER"
-        NUMBERS=$(commit_pull_numbers "$PARENT_SHA") || exit 1
-    fi
-    grep -qx "$PR_NUMBER" <<<"$NUMBERS"
 }
 
 # Echoes "<number> <head branch>" for each open PR based on the merged branch.
@@ -425,19 +374,11 @@ main() {
         return 0
     fi
 
-    # Rebase merges are not supported: the copies on the target are new
-    # commits, so a child retargeted as-is would show its parent's changes in
-    # its diff, and the squash sequence can raise spurious conflicts against
-    # the intermediate copies. Tell the children and leave everything alone.
-    if is_rebase_merge "$PR_NUMBER"; then
-        echo "⚠️ '$MERGED_BRANCH' looks rebase-merged; rebase merges are not supported, leaving the stack alone"
-        CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
-        while read -r NUMBER BRANCH; do
-            [[ -n "$BRANCH" ]] || continue
-            run gh pr comment "$NUMBER" --body "ℹ️ The base branch \`$MERGED_BRANCH\` of this PR was merged with \"Rebase and merge\", which autorestack does not support. Update this PR manually. \`$MERGED_BRANCH\` was kept so this PR stays open."
-        done <<<"$CHILDREN"
-        return 0
-    fi
+    # A squash merge and a rebase merge both land the branch's content as new
+    # commits without merging its history, and both take the path below.
+    # SQUASH_COMMIT (the PR's merge_commit_sha) is the squash commit or the
+    # last rebased copy; either way its tree carries the merged branch's full
+    # content, which is all the single-merge re-parent reads from it.
 
     # Find all PRs directly targeting the merged PR's head
     CHILDREN=$(list_child_prs) || die "could not list the PRs based on $MERGED_BRANCH"
