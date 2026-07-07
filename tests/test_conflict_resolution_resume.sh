@@ -280,5 +280,31 @@ git -C "$ORIGIN" rev-parse --verify -q parent >/dev/null || fail "I: old base br
 grep -q -- "push origin :parent" "$CALLS" && fail "I: deletion must not be attempted"
 ok "I: sibling-listing API failure keeps the old base branch"
 
+# ---------------------------------------------------------------------------
+echo "### Scenario J: head lacks the squash commit -> re-post the comment, keep the label"
+setup_repo
+# The pushed resolution does not contain the squash commit: the user pushed
+# early, or followed an old-format comment (a prior action version) whose
+# resolution never folds it in. Advance main with a commit the child lacks so
+# the ancestry check fails.
+git checkout -q main
+echo squash > s.txt && git add s.txt && git commit -qm squash
+SQUASH2=$(git rev-parse main)
+git push -q origin main
+git checkout -q child
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"   # matches marker -> not a manual retarget
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH2"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=1" "$WORK/out.log" || fail "J: run must fail while the PR is unresolved"
+grep -q "gh pr comment" "$CALLS" || fail "J: conflict comment not re-posted"
+grep -q -- "add-label autorestack-needs-conflict-resolution" "$CALLS" || fail "J: conflict label not kept"
+grep -q "remove-label" "$CALLS" && fail "J: label must NOT be removed"
+grep -q -- "--base" "$CALLS" && fail "J: base must NOT be edited"
+[[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "J: child was pushed"
+ok "J: unresolved head re-posts the conflict comment and keeps the label armed"
+
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"

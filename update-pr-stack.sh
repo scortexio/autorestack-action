@@ -120,6 +120,38 @@ abort_merge_if_in_progress() {
     fi
 }
 
+# Post the conflict-resolution comment and add the conflict label.
+# Args: head branch, merged parent branch, final target branch, squash hash, PR number.
+# The user re-parents the head from MERGED onto TARGET with git-merge-onto; the
+# state marker records both plus the squash so the resume can finalize.
+post_conflict_comment() {
+    local BRANCH="$1" MERGED="$2" TARGET="$3" SQUASH_HASH="$4" PR_NUMBER="$5"
+    {
+        echo "### ⚠️ Automatic update blocked by a merge conflict"
+        echo
+        echo "Resolve it like this:"
+        echo '```bash'
+        echo "git fetch origin"
+        echo "git switch $BRANCH"
+        echo "git merge --ff-only origin/$BRANCH"
+        echo "uvx git-merge-onto origin/$TARGET origin/$MERGED --absorbed"
+        echo '```'
+        echo
+        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
+        echo
+        echo '```bash'
+        echo "git push origin $BRANCH"
+        echo '```'
+        echo
+        echo "Once you push, this action will resume and finish updating this pull request."
+        echo
+        format_state_marker "$MERGED" "$TARGET" "$SQUASH_HASH"
+    } | try gh pr comment "$PR_NUMBER" -F - \
+        || die "could not post the conflict-resolution comment on PR #$PR_NUMBER"
+    gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
+    run gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
+}
+
 # Args: head branch, base branch, PR number. git commands use the branch; gh
 # commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
@@ -180,30 +212,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     abort_merge_if_in_progress
     local SQUASH_HASH_FOR_MARKER
     SQUASH_HASH_FOR_MARKER=$(git rev-parse SQUASH_COMMIT) || die "cannot resolve SQUASH_COMMIT"
-    {
-        echo "### ⚠️ Automatic update blocked by a merge conflict"
-        echo
-        echo "Resolve it like this:"
-        echo '```bash'
-        echo "git fetch origin"
-        echo "git switch $BRANCH"
-        echo "git merge --ff-only origin/$BRANCH"
-        echo "uvx git-merge-onto origin/$BASE_BRANCH origin/$MERGED_BRANCH --absorbed"
-        echo '```'
-        echo
-        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
-        echo
-        echo '```bash'
-        echo "git push origin $BRANCH"
-        echo '```'
-        echo
-        echo "Once you push, this action will resume and finish updating this pull request."
-        echo
-        format_state_marker "$MERGED_BRANCH" "$TARGET_BRANCH" "$SQUASH_HASH_FOR_MARKER"
-    } | try gh pr comment "$PR_NUMBER" -F - \
-        || die "could not post the conflict-resolution comment on PR #$PR_NUMBER"
-    gh label create "$CONFLICT_LABEL" --description "PR needs manual conflict resolution" --color "d73a4a" 2>/dev/null || true
-    run gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
+    post_conflict_comment "$BRANCH" "$MERGED_BRANCH" "$TARGET_BRANCH" "$SQUASH_HASH_FOR_MARKER" "$PR_NUMBER"
     return 1
 }
 
@@ -324,10 +333,13 @@ continue_after_resolution() {
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
     if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
-        # Fail loudly rather than silently: the user pushed without finishing the
-        # re-parent, so a red run is the signal they need to look again.
-        echo "❌ '$PR_BRANCH' does not contain the squash commit; the conflict is not resolved." >&2
-        echo "   Follow the conflict comment on this PR (run its git-merge-onto command), then push again." >&2
+        # The head does not contain the squash commit: the user pushed without
+        # finishing the re-parent, or followed an old-format conflict comment (a
+        # prior action version) whose resolution never folds the squash in. Re-post
+        # the current instructions and keep the label on so the next push resumes.
+        # Still return 1: a red run flags that the PR is not resolved yet.
+        echo "⚠️ '$PR_BRANCH' does not contain the squash commit yet; re-posting the conflict comment." >&2
+        post_conflict_comment "$PR_BRANCH" "$OLD_BASE" "$NEW_TARGET" "$SQUASH_HASH" "$PR_NUMBER"
         return 1
     fi
 
