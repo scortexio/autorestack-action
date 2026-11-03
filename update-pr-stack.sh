@@ -6,6 +6,7 @@
 # SQUASH_COMMIT - The merged PR's merge_commit_sha: the squash commit, or the
 #                 last copied commit of a rebase merge
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
+# MERGED_TIP    - The merged PR's head commit, as GitHub merged it
 # TARGET_BRANCH - The name of the branch that the PR was merged into
 # PR_NUMBER - The number of the PR that was merged
 #
@@ -178,7 +179,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     fi
 
     # Re-parent the child onto the target in a single merge: merge the squash
-    # commit with the base forced to merge-base(HEAD, origin/$MERGED_BRANCH). That
+    # commit with the base forced to merge-base(HEAD, MERGED_TIP). That
     # drops the merged branch's content (now carried by the target via the squash)
     # while keeping the child's own changes -- the merge equivalent of
     # `git rebase --onto`, done by the vendored git-merge-onto. --absorbed records
@@ -186,7 +187,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # from its current base (the merged branch) even when that base moved after
     # the head forked, so the PR reads as mergeable until it is retargeted.
     local RC=0
-    try python3 "$SCRIPT_DIR/git-merge-onto" --absorbed -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
+    try python3 "$SCRIPT_DIR/git-merge-onto" --absorbed -m "$MERGE_MSG" SQUASH_COMMIT MERGED_TIP || RC=$?
     if [[ "$RC" -eq 0 ]]; then
         return 0
     fi
@@ -365,10 +366,12 @@ main() {
     # Check required environment variables
     check_env_var "SQUASH_COMMIT"
     check_env_var "MERGED_BRANCH"
+    check_env_var "MERGED_TIP"
     check_env_var "TARGET_BRANCH"
     check_env_var "PR_NUMBER"
 
     run git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
+    run git update-ref MERGED_TIP "$MERGED_TIP"
 
     # A merge-commit merge does not rewrite history: each child's head already
     # contains the merged branch's commits, and the merge commit carries them
@@ -382,7 +385,7 @@ main() {
             run gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
         done <<<"$CHILDREN"
         # Deleting a PR's base branch closes the PR, so the retargets come first.
-        run git push origin ":$MERGED_BRANCH"
+        run git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH"
         return 0
     fi
 
@@ -429,8 +432,10 @@ main() {
 
     # Deleting a PR's base branch closes the PR, so this must come after the
     # retargets. Keep the branch for reference while conflicted PRs remain.
+    # The lease keeps commits pushed to the branch after the merge: they are in
+    # neither the squash commit nor the children.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        run git push origin ":$MERGED_BRANCH"
+        run git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH"
     else
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi

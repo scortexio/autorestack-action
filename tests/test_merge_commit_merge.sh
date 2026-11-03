@@ -50,6 +50,7 @@ FEATURE2_BEFORE=$(git rev-parse feature2)
 OUT=$(env \
     SQUASH_COMMIT="$MERGE_COMMIT" \
     MERGED_BRANCH=feature1 \
+    MERGED_TIP=$(git rev-parse feature1) \
     PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
@@ -69,7 +70,7 @@ fi
 # Children must be retargeted before the merged branch is deleted (deleting a
 # PR's base branch closes the PR).
 EDIT_LINE=$(grep -n "pr edit 2 --base main" <<<"$OUT" | cut -d: -f1 | head -1 || true)
-DELETE_LINE=$(grep -n "push origin :feature1" <<<"$OUT" | cut -d: -f1 | head -1 || true)
+DELETE_LINE=$(grep -n "origin :feature1" <<<"$OUT" | cut -d: -f1 | head -1 || true)
 if [[ -z "$EDIT_LINE" ]]; then
     echo "❌ Child PR must be retargeted onto main"
     exit 1
