@@ -326,19 +326,24 @@ continue_after_resolution() {
     fi
 
     # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
-    # head now contains the squash commit. Verify that and finalize -- do NOT re-run
-    # the merge. Its forced base is the old parent, where the lines the user just
-    # resolved still differ from the trunk, so a re-merge would re-raise the very
-    # conflict they fixed. A plain ancestry check is all the resume needs.
+    # head now contains the squash commit and, through --absorbed, the old base's
+    # tip. Verify that and finalize -- do NOT re-run the merge. Its forced base is
+    # the old parent, where the lines the user just resolved still differ from the
+    # trunk, so a re-merge would re-raise the very conflict they fixed.
+    #
+    # The squash commit alone is not enough: a plain `git merge origin/<target>`
+    # also brings it in, but merges from the natural merge base, which predates
+    # the old base's later commits. Lines those commits removed come back.
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
-    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
-        # The head does not contain the squash commit: the user pushed without
-        # finishing the re-parent, or followed an old-format conflict comment (a
-        # prior action version) whose resolution never folds the squash in. Re-post
-        # the current instructions and keep the label on so the next push resumes.
-        # Still return 1: a red run flags that the PR is not resolved yet.
-        echo "⚠️ '$PR_BRANCH' does not contain the squash commit yet; re-posting the conflict comment." >&2
+    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH" \
+        || ! git merge-base --is-ancestor "origin/$OLD_BASE" "$PR_BRANCH"; then
+        # The user pushed without finishing the re-parent, resolved with a plain
+        # merge, or followed an old-format conflict comment (a prior action
+        # version). Re-post the current instructions and keep the label on so the
+        # next push resumes. Still return 1: a red run flags that the PR is not
+        # resolved yet.
+        echo "⚠️ '$PR_BRANCH' does not contain both the squash commit and the tip of '$OLD_BASE' yet; re-posting the conflict comment." >&2
         post_conflict_comment "$PR_BRANCH" "$OLD_BASE" "$NEW_TARGET" "$SQUASH_HASH" "$PR_NUMBER"
         return 1
     fi
