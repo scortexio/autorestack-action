@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Replays the incident that motivated --absorbed (scortexio/gh-stack-mv#36):
+# Replays the incident that stranded a conflicted PR (scortexio/gh-stack-mv#36):
 #
 #   1. main <- feature1 <- feature2, where feature1 advanced AFTER feature2
 #      forked (in the incident, autorestack itself advanced it when a
@@ -8,7 +8,8 @@
 #      feature2.
 #   2. feature1 is squash-merged; the action's re-parent of feature2 conflicts,
 #      so the action posts the resolution comment and stops.
-#   3. The user resolves by running the posted re-parent with --absorbed.
+#   3. The user resolves with the two posted merges: origin/feature1, then
+#      origin/main.
 #
 # The resolution must descend from origin/feature1's tip: feature2's PR is
 # still based on feature1 at that point, and GitHub creates no pull_request
@@ -102,28 +103,33 @@ if [[ "$(git rev-parse feature2)" != "$FEATURE2_BEFORE" ]]; then
     echo "❌ feature2 must not move on a conflict"
     exit 1
 fi
-if ! grep -q -- "--absorbed" "$COMMENT_FILE"; then
-    echo "❌ The posted resolution command must use --absorbed"
-    cat "$COMMENT_FILE"
-    exit 1
-fi
-echo "✅ Conflict detected: comment posted with --absorbed, stack left alone"
+for REF in origin/feature1 origin/main; do
+    if ! grep -qxF "git merge $REF" "$COMMENT_FILE"; then
+        echo "❌ The posted resolution must run 'git merge $REF'"
+        cat "$COMMENT_FILE"
+        exit 1
+    fi
+done
+echo "✅ Conflict detected: two-step resolution posted, stack left alone"
 
-# Resolve as the comment instructs, with the vendored copy standing in for
-# `uvx git-merge-onto` (unit tests have no network).
+# Resolve as the comment instructs. Both merges conflict: feature2 rewrote line 2,
+# which feature1 rewrote too, and a plain merge of main uses the true merge base,
+# from before feature1 existed.
 log_cmd git checkout feature2
-if python3 "$SCRIPT_DIR/../git-merge-onto" --absorbed origin/main origin/feature1; then
-    echo "❌ The re-parent should conflict (both sides rewrote line 2)"
-    exit 1
-fi
-sed -i '/^<<<<<<</,/^>>>>>>>/c\Feature 2 version' file.txt
-log_cmd git add file.txt
-log_cmd git commit --no-edit
+for REF in origin/feature1 origin/main; do
+    if log_cmd git merge --no-edit "$REF"; then
+        echo "❌ Merging $REF should conflict (both sides rewrote line 2)"
+        exit 1
+    fi
+    sed -i '/^<<<<<<</,/^>>>>>>>/c\Feature 2 version' file.txt
+    log_cmd git add file.txt
+    log_cmd git commit --no-edit
+done
 simulate_push feature2
 
 # The regression assertion: the resolution descends from the old base's tip.
 if log_cmd git merge-base --is-ancestor "$FEATURE1_TIP" feature2; then
-    echo "✅ Resolution descends from origin/feature1's tip (--absorbed recorded it)"
+    echo "✅ Resolution descends from origin/feature1's tip (first merge recorded it)"
 else
     echo "❌ Resolution does not descend from origin/feature1's tip"
     log_cmd git log --graph --oneline feature2 feature1
@@ -143,5 +149,5 @@ else
 fi
 
 echo ""
-echo "All absorbed-resolution tests passed! 🎉"
+echo "All two-step resolution tests passed! 🎉"
 echo "Test repository remains at: $TEST_REPO for inspection"
