@@ -21,6 +21,7 @@ jobs:
           bash tests/test_conflict_absorbed_resolution.sh
           bash tests/test_merge_commit_merge.sh
           bash tests/test_rebase_merge.sh
+          bash tests/test_merged_branch_moved.sh
           bash tests/test_merged_branch_already_deleted.sh
 
   e2e-tests:
@@ -44,7 +45,7 @@ jobs:
       # comment, which calls `uvx git-merge-onto`. The action itself uses the
       # vendored copy via python3 and needs no uv.
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Run e2e tests
         env:

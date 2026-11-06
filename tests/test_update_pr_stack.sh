@@ -82,6 +82,7 @@ run_update_pr_stack() {
     env \
     SQUASH_COMMIT=$SQUASH_COMMIT \
     MERGED_BRANCH=feature1 \
+    MERGED_TIP=$(git rev-parse feature1) \
     PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
@@ -95,7 +96,7 @@ run_update_pr_stack
 # the retarget (deleting a PR's base branch closes the PR).
 push_line=$(grep -n "git push origin feature2" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
 edit_line=$(grep -n "pr edit 2 --base main" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
-delete_line=$(grep -n "git push origin :feature1" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
+delete_line=$(grep -n "origin :feature1" "$RUN_LOG" | head -1 | cut -d: -f1 || true)
 if [[ -n "$push_line" && -n "$edit_line" && -n "$delete_line" \
       && "$push_line" -lt "$edit_line" && "$edit_line" -lt "$delete_line" ]]; then
     echo "✅ Ordering: push head, then retarget base, then delete merged branch"
@@ -220,6 +221,7 @@ FAIL_LOG="$TEST_REPO/update_fail_run.log"
 if log_cmd env \
     SQUASH_COMMIT=$SQUASH_COMMIT \
     MERGED_BRANCH=feature1 \
+    MERGED_TIP=$(git rev-parse feature1) \
     PR_NUMBER=1 \
     TARGET_BRANCH=main \
     MOCK_PR_LIST_FAIL=1 \
@@ -230,7 +232,7 @@ if log_cmd env \
     cat "$FAIL_LOG"
     exit 1
 fi
-if grep -q "git push origin :feature1" "$FAIL_LOG"; then
+if grep -q "origin :feature1" "$FAIL_LOG"; then
     echo "❌ merged branch must not be deleted when the children cannot be listed"
     cat "$FAIL_LOG"
     exit 1

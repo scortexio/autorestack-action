@@ -81,6 +81,7 @@ COMMENT_FILE=$(mktemp)
 OUT=$(env \
     SQUASH_COMMIT="$SQUASH_COMMIT" \
     MERGED_BRANCH=feature1 \
+    MERGED_TIP=$(git rev-parse feature1) \
     PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
@@ -93,7 +94,7 @@ if ! grep -q "Mock: gh pr comment 2" <<<"$OUT"; then
     echo "❌ Expected a conflict comment on the child PR"
     exit 1
 fi
-if grep -q "push origin :feature1" <<<"$OUT"; then
+if grep -q "origin :feature1" <<<"$OUT"; then
     echo "❌ The merged branch must be kept while the child is conflicted"
     exit 1
 fi

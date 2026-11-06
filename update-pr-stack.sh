@@ -6,6 +6,7 @@
 # SQUASH_COMMIT - The merged PR's merge_commit_sha: the squash commit, or the
 #                 last copied commit of a rebase merge
 # MERGED_BRANCH - The name of the branch that was merged and will be deleted
+# MERGED_TIP    - The merged PR's head commit, as GitHub merged it
 # TARGET_BRANCH - The name of the branch that the PR was merged into
 # PR_NUMBER - The number of the PR that was merged
 #
@@ -153,13 +154,18 @@ post_conflict_comment() {
 }
 
 # Deleting a PR's base branch closes the PR, so callers must retarget first.
-# The branch can already be gone by then: a human clicking "Delete branch" right
-# after the merge races this run, and "delete branch on merge" wins it outright.
-# Everything that matters is done at that point, so a failed delete is a warning,
-# not a red run.
+# The lease keeps commits pushed to the branch after the merge: they are in
+# neither the squash commit nor the children. The branch can also be gone
+# already: a human clicking "Delete branch" right after the merge races this run.
+# Everything that matters is done at that point, so only that case stays green.
 delete_merged_branch() {
-    try git push origin ":$MERGED_BRANCH" \
-        || echo "⚠️ Could not delete '$MERGED_BRANCH' (may already be deleted)"
+    try git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH" && return 0
+    local RC=0
+    try git ls-remote --exit-code --heads origin "refs/heads/$MERGED_BRANCH" >/dev/null || RC=$?
+    if [[ "$RC" -ne 2 ]]; then
+        die "could not delete '$MERGED_BRANCH'"
+    fi
+    echo "⚠️ '$MERGED_BRANCH' was already deleted"
 }
 
 # Args: head branch, base branch, PR number. git commands use the branch; gh
@@ -188,7 +194,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     fi
 
     # Re-parent the child onto the target in a single merge: merge the squash
-    # commit with the base forced to merge-base(HEAD, origin/$MERGED_BRANCH). That
+    # commit with the base forced to merge-base(HEAD, MERGED_TIP). That
     # drops the merged branch's content (now carried by the target via the squash)
     # while keeping the child's own changes -- the merge equivalent of
     # `git rebase --onto`, done by the vendored git-merge-onto. --absorbed records
@@ -196,7 +202,7 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # from its current base (the merged branch) even when that base moved after
     # the head forked, so the PR reads as mergeable until it is retargeted.
     local RC=0
-    try python3 "$SCRIPT_DIR/git-merge-onto" --absorbed -m "$MERGE_MSG" SQUASH_COMMIT "origin/$MERGED_BRANCH" || RC=$?
+    try python3 "$SCRIPT_DIR/git-merge-onto" --absorbed -m "$MERGE_MSG" SQUASH_COMMIT MERGED_TIP || RC=$?
     if [[ "$RC" -eq 0 ]]; then
         return 0
     fi
@@ -336,19 +342,24 @@ continue_after_resolution() {
     fi
 
     # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
-    # head now contains the squash commit. Verify that and finalize -- do NOT re-run
-    # the merge. Its forced base is the old parent, where the lines the user just
-    # resolved still differ from the trunk, so a re-merge would re-raise the very
-    # conflict they fixed. A plain ancestry check is all the resume needs.
+    # head now contains the squash commit and, through --absorbed, the old base's
+    # tip. Verify that and finalize -- do NOT re-run the merge. Its forced base is
+    # the old parent, where the lines the user just resolved still differ from the
+    # trunk, so a re-merge would re-raise the very conflict they fixed.
+    #
+    # The squash commit alone is not enough: a plain `git merge origin/<target>`
+    # also brings it in, but merges from the natural merge base, which predates
+    # the old base's later commits. Lines those commits removed come back.
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
-    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH"; then
-        # The head does not contain the squash commit: the user pushed without
-        # finishing the re-parent, or followed an old-format conflict comment (a
-        # prior action version) whose resolution never folds the squash in. Re-post
-        # the current instructions and keep the label on so the next push resumes.
-        # Still return 1: a red run flags that the PR is not resolved yet.
-        echo "⚠️ '$PR_BRANCH' does not contain the squash commit yet; re-posting the conflict comment." >&2
+    if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH" \
+        || ! git merge-base --is-ancestor "origin/$OLD_BASE" "$PR_BRANCH"; then
+        # The user pushed without finishing the re-parent, resolved with a plain
+        # merge, or followed an old-format conflict comment (a prior action
+        # version). Re-post the current instructions and keep the label on so the
+        # next push resumes. Still return 1: a red run flags that the PR is not
+        # resolved yet.
+        echo "⚠️ '$PR_BRANCH' does not contain both the squash commit and the tip of '$OLD_BASE' yet; re-posting the conflict comment." >&2
         post_conflict_comment "$PR_BRANCH" "$OLD_BASE" "$NEW_TARGET" "$SQUASH_HASH" "$PR_NUMBER"
         return 1
     fi
@@ -375,10 +386,12 @@ main() {
     # Check required environment variables
     check_env_var "SQUASH_COMMIT"
     check_env_var "MERGED_BRANCH"
+    check_env_var "MERGED_TIP"
     check_env_var "TARGET_BRANCH"
     check_env_var "PR_NUMBER"
 
     run git update-ref SQUASH_COMMIT "$SQUASH_COMMIT"
+    run git update-ref MERGED_TIP "$MERGED_TIP"
 
     # A merge-commit merge does not rewrite history: each child's head already
     # contains the merged branch's commits, and the merge commit carries them

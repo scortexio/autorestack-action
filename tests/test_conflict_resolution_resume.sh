@@ -306,5 +306,39 @@ grep -q -- "--base" "$CALLS" && fail "J: base must NOT be edited"
 [[ "$(git -C "$ORIGIN" rev-parse child)" == "$CHILD_BEFORE" ]] || fail "J: child was pushed"
 ok "J: unresolved head re-posts the conflict comment and keeps the label armed"
 
+# ---------------------------------------------------------------------------
+echo "### Scenario K: head merged the target but not the old base's tip -> re-post, keep the label"
+setup_repo
+# The parent got a review commit after the child forked, removing a line. The
+# user resolved with a plain merge of main: the head contains the squash commit
+# but not the parent's tip, and the removed line is back in the child.
+git checkout -q parent
+echo kept > p.txt && echo removed-in-review > r.txt && git add p.txt r.txt && git commit -qm "parent"
+git push -q origin parent
+git checkout -q child
+git merge -q --no-edit parent
+git checkout -q parent
+git rm -q r.txt && git commit -qm "review: remove line"
+git push -q origin parent
+git checkout -q main
+git merge -q --squash parent && git commit -qm "Squash merge parent"
+SQUASH2=$(git rev-parse main)
+git push -q origin main
+git checkout -q child
+git merge -q --no-edit main
+git cat-file -e child:r.txt || fail "K: setup must bring the removed line back"
+git push -q origin child
+MOCK_LABELS="autorestack-needs-conflict-resolution"
+PR_BASE="parent"
+MOCK_COMMENTS_FILE="$WORK/comments.txt"
+{ echo "### conflict"; echo; marker parent main "$SQUASH2"; } > "$MOCK_COMMENTS_FILE"
+run_resume
+
+grep -q "EXIT=1" "$WORK/out.log" || fail "K: run must fail while the PR is unresolved"
+grep -q "gh pr comment" "$CALLS" || fail "K: conflict comment not re-posted"
+grep -q "remove-label" "$CALLS" && fail "K: label must NOT be removed"
+grep -q -- "--base" "$CALLS" && fail "K: base must NOT be edited"
+ok "K: plain merge of the target is not accepted as a resolution"
+
 echo
 echo "All conflict-resume tests passed 🎉 ($PASS scenarios)"
