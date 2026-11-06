@@ -59,6 +59,7 @@ simulate_push main
 OUT=$(env \
     SQUASH_COMMIT="$MERGE_COMMIT" \
     MERGED_BRANCH=feature1 \
+    MERGED_TIP=$(git rev-parse feature1) \
     PR_NUMBER=1 \
     TARGET_BRANCH=main \
     GH="$SCRIPT_DIR/mock_gh.sh" \
@@ -75,7 +76,7 @@ if ! grep -q "Mock: gh pr edit 2 --base main" <<<"$OUT"; then
     echo "❌ The child PR must be retargeted to main"
     exit 1
 fi
-if ! grep -q "push origin :feature1" <<<"$OUT"; then
+if ! grep -q "origin :feature1" <<<"$OUT"; then
     echo "❌ The merged branch must be deleted"
     exit 1
 fi
