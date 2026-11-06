@@ -22,6 +22,7 @@ jobs:
           bash tests/test_merge_commit_merge.sh
           bash tests/test_rebase_merge.sh
           bash tests/test_merged_branch_moved.sh
+          bash tests/test_merged_branch_already_deleted.sh
 
   e2e-tests:
     name: E2E Tests
