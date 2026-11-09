@@ -160,6 +160,21 @@ post_conflict_comment() {
     run gh pr edit "$PR_NUMBER" --add-label "$CONFLICT_LABEL"
 }
 
+# Deleting a PR's base branch closes the PR, so callers must retarget first.
+# The lease keeps commits pushed to the branch after the merge: they are in
+# neither the squash commit nor the children. The branch can also be gone
+# already: a human clicking "Delete branch" right after the merge races this run.
+# Everything that matters is done at that point, so only that case stays green.
+delete_merged_branch() {
+    try git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH" && return 0
+    local RC=0
+    try git ls-remote --exit-code --heads origin "refs/heads/$MERGED_BRANCH" >/dev/null || RC=$?
+    if [[ "$RC" -ne 2 ]]; then
+        die "could not delete '$MERGED_BRANCH'"
+    fi
+    echo "⚠️ '$MERGED_BRANCH' was already deleted"
+}
+
 # Args: head branch, base branch, PR number. git commands use the branch; gh
 # commands use the number, since a head branch can carry several PRs.
 update_direct_target() {
@@ -398,8 +413,7 @@ main() {
             [[ -n "$BRANCH" ]] || continue
             run gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
         done <<<"$CHILDREN"
-        # Deleting a PR's base branch closes the PR, so the retargets come first.
-        run git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH"
+        delete_merged_branch
         return 0
     fi
 
@@ -444,12 +458,9 @@ main() {
         run gh pr edit "$NUMBER" --base "$TARGET_BRANCH"
     done
 
-    # Deleting a PR's base branch closes the PR, so this must come after the
-    # retargets. Keep the branch for reference while conflicted PRs remain.
-    # The lease keeps commits pushed to the branch after the merge: they are in
-    # neither the squash commit nor the children.
+    # Keep the branch for reference while conflicted PRs remain.
     if [[ "${#CONFLICTED_TARGETS[@]}" -eq 0 ]]; then
-        run git push --force-with-lease="$MERGED_BRANCH:MERGED_TIP" origin ":$MERGED_BRANCH"
+        delete_merged_branch
     else
         echo "⚠️ Keeping branch '$MERGED_BRANCH' - still referenced by conflicted PRs: ${CONFLICTED_TARGETS[*]}"
     fi
