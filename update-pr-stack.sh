@@ -123,29 +123,22 @@ abort_merge_if_in_progress() {
 
 # Post the conflict-resolution comment and add the conflict label.
 # Args: head branch, merged parent branch, final target branch, squash hash, PR number.
-# The user merges MERGED, then TARGET; the state marker records both plus the
-# squash so the resume can finalize.
+# The user re-parents the head from MERGED onto TARGET with git-merge-onto; the
+# state marker records both plus the squash so the resume can finalize.
 post_conflict_comment() {
     local BRANCH="$1" MERGED="$2" TARGET="$3" SQUASH_HASH="$4" PR_NUMBER="$5"
     {
         echo "### ⚠️ Automatic update blocked by a merge conflict"
         echo
-        echo "Resolve it in two steps. First merge the base branch \`$MERGED\`:"
+        echo "Resolve it like this:"
         echo '```bash'
         echo "git fetch origin"
         echo "git switch $BRANCH"
         echo "git merge --ff-only origin/$BRANCH"
-        echo "git merge origin/$MERGED"
+        echo "uvx git-merge-onto origin/$TARGET origin/$MERGED --absorbed"
         echo '```'
         echo
-        echo 'Fix any conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
-        echo
-        echo "Then merge \`$TARGET\`:"
-        echo '```bash'
-        echo "git merge origin/$TARGET"
-        echo '```'
-        echo
-        echo 'Fix any conflicts the same way, then push:'
+        echo 'Fix the conflicts (for instance with `git mergetool`), then run `git add -A && git commit` to finish the merge.'
         echo
         echo '```bash'
         echo "git push origin $BRANCH"
@@ -229,12 +222,9 @@ See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
     # head forked (an ancestor PR merged first), GitHub falls back to a textual
     # merge to decide mergeability, which fails exactly when the resolution
     # rewrote the same lines. That would strand the PR: no run, label stuck.
-    # The posted `git merge origin/$MERGED_BRANCH` prevents this: the pushed head
-    # descends from its base again, so the resume event is guaranteed to fire.
-    #
-    # The posted merge of the target uses the true merge base, not the merged
-    # branch's tip: if the child deleted a line the merged branch added, the line
-    # comes back without a conflict.
+    # --absorbed in the posted command is what prevents this: it records the
+    # merged branch's tip as a parent of the resolution, so the pushed head
+    # descends from its base again and the resume event is guaranteed to fire.
     abort_merge_if_in_progress
     local SQUASH_HASH_FOR_MARKER
     SQUASH_HASH_FOR_MARKER=$(git rev-parse SQUASH_COMMIT) || die "cannot resolve SQUASH_COMMIT"
@@ -341,8 +331,8 @@ continue_after_resolution() {
         return
     fi
 
-    # Same check for the old base: the resolution we posted merges
-    # origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
+    # Same check for the old base: the resolution command we posted re-parents
+    # against origin/$OLD_BASE, so if that branch is gone (auto-delete head branches
     # left enabled, or deleted manually) the user cannot resolve and the label would
     # re-trigger a failing run on every push. Give up cleanly instead.
     if ! git rev-parse --verify --quiet "origin/$OLD_BASE" >/dev/null; then
@@ -351,23 +341,24 @@ continue_after_resolution() {
         return
     fi
 
-    # The user resolved by merging the old base, then the target (the comment's
-    # two steps), so the head now contains the old base's tip and the squash
-    # commit. Verify that and finalize -- do NOT re-run the re-parent. Its forced
-    # base is the old parent, where the lines the user just resolved still differ
-    # from the trunk, so a re-merge would re-raise the very conflict they fixed.
+    # The user resolved by re-parenting (the comment's `git-merge-onto`), so the
+    # head now contains the squash commit and, through --absorbed, the old base's
+    # tip. Verify that and finalize -- do NOT re-run the merge. Its forced base is
+    # the old parent, where the lines the user just resolved still differ from the
+    # trunk, so a re-merge would re-raise the very conflict they fixed.
     #
-    # The squash commit alone is not enough: `git merge origin/<target>` also
-    # brings it in, but without the old base merged first, lines removed by the
-    # old base's later commits come back.
+    # The squash commit alone is not enough: a plain `git merge origin/<target>`
+    # also brings it in, but merges from the natural merge base, which predates
+    # the old base's later commits. Lines those commits removed come back.
     run git update-ref SQUASH_COMMIT "$SQUASH_HASH"
     run git checkout "$PR_BRANCH"
     if ! git merge-base --is-ancestor SQUASH_COMMIT "$PR_BRANCH" \
         || ! git merge-base --is-ancestor "origin/$OLD_BASE" "$PR_BRANCH"; then
-        # The user pushed without finishing both merges, or followed an old-format
-        # conflict comment (a prior action version). Re-post the current
-        # instructions and keep the label on so the next push resumes. Still
-        # return 1: a red run flags that the PR is not resolved yet.
+        # The user pushed without finishing the re-parent, resolved with a plain
+        # merge, or followed an old-format conflict comment (a prior action
+        # version). Re-post the current instructions and keep the label on so the
+        # next push resumes. Still return 1: a red run flags that the PR is not
+        # resolved yet.
         echo "⚠️ '$PR_BRANCH' does not contain both the squash commit and the tip of '$OLD_BASE' yet; re-posting the conflict comment." >&2
         post_conflict_comment "$PR_BRANCH" "$OLD_BASE" "$NEW_TARGET" "$SQUASH_HASH" "$PR_NUMBER"
         return 1
