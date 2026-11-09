@@ -137,6 +137,8 @@ jobs:
 * Works with squash merges and rebase merges: both land the branch's content as new commits without merging its history, so the children are re-parented onto the landed tip (the squash commit, or the last copied commit of a rebase merge). A PR merged with a merge commit keeps its history, so the action only retargets its children and deletes the branch.
 * If a merge hits a conflict, you'll need to resolve it manually; pushing the resolution automatically continues the stack update
 * Very large stacks might hit GitHub rate limits
+* Don't delete a merged branch yourself; the action deletes it once the child PRs are updated. If you delete it before the action runs, GitHub moves the child PRs onto the trunk without updating them, so their diffs show the parent's changes, and the run may fail.
+* Don't push to a branch after its PR is merged. If a child PR is waiting on a conflict resolution, the new commits end up recorded as merged in the child without their changes, and the action deletes the branch once the child is resolved.
 * After retargeting, GitHub sometimes keeps rendering a PR's diff against its old, deleted base, so the PR appears to contain already-merged changes. The branch itself is correct (`git diff <base>...HEAD` shows the real diff). Pushing any commit to the PR usually makes GitHub recompute. Sometimes it doesn't. Tough luck.
 
 ---
