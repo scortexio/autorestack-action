@@ -8,7 +8,7 @@
 #      feature2.
 #   2. feature1 is squash-merged; the action's re-parent of feature2 conflicts,
 #      so the action posts the resolution comment and stops.
-#   3. The user resolves by running the posted re-parent with --absorbed.
+#   3. The user resolves by running the posted re-parent.
 #
 # The resolution must descend from origin/feature1's tip: feature2's PR is
 # still based on feature1 at that point, and GitHub creates no pull_request
@@ -102,17 +102,16 @@ if [[ "$(git rev-parse feature2)" != "$FEATURE2_BEFORE" ]]; then
     echo "❌ feature2 must not move on a conflict"
     exit 1
 fi
-if ! grep -q -- "--absorbed" "$COMMENT_FILE"; then
-    echo "❌ The posted resolution command must use --absorbed"
+REPARENT=$(grep -x 'git merge .*' "$COMMENT_FILE") || {
+    echo "❌ The comment must post a re-parent command"
     cat "$COMMENT_FILE"
     exit 1
-fi
-echo "✅ Conflict detected: comment posted with --absorbed, stack left alone"
+}
+echo "✅ Conflict detected: comment posted, stack left alone"
 
-# Resolve as the comment instructs, with the vendored copy standing in for
-# `uvx git-merge-onto` (unit tests have no network).
+# Resolve as the comment instructs.
 log_cmd git checkout feature2
-if python3 "$SCRIPT_DIR/../git-merge-onto" --absorbed origin/main origin/feature1; then
+if bash -c "$REPARENT"; then
     echo "❌ The re-parent should conflict (both sides rewrote line 2)"
     exit 1
 fi
@@ -123,7 +122,7 @@ simulate_push feature2
 
 # The regression assertion: the resolution descends from the old base's tip.
 if log_cmd git merge-base --is-ancestor "$FEATURE1_TIP" feature2; then
-    echo "✅ Resolution descends from origin/feature1's tip (--absorbed recorded it)"
+    echo "✅ Resolution descends from origin/feature1's tip (the re-parent recorded it)"
 else
     echo "❌ Resolution does not descend from origin/feature1's tip"
     log_cmd git log --graph --oneline feature2 feature1
